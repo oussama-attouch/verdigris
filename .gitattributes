@@ -1,7 +1,7 @@
-﻿# Source files — LF everywhere, regardless of OS
+# Source files - LF everywhere, regardless of OS
 * text=auto eol=lf
 
-# Explicitly binary — never normalize
+# Explicitly binary - never normalize
 *.rdb binary
 *.aof binary
 *.png binary
