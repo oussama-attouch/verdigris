@@ -15,11 +15,6 @@ import (
 // name a registered command.
 var ErrUnknownCommand = errors.New("unknown command")
 
-// errInternal marks a handler fault that the caller should log and replace
-// with a generic reply. It exists so that a handler can signal "this is a bug"
-// without inventing a message, and so tests can assert on the distinction.
-var errInternal = errors.New("internal command fault")
-
 // Registry maps command names to handlers. Names are case-insensitive on
 // lookup, matching Redis's behavior.
 type Registry struct {

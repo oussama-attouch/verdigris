@@ -64,15 +64,14 @@ type Server struct {
 	// the binding decision is made in exactly one place.
 	addr string
 
-	// store is the keyspace every connection on this server shares. It is a
-	// field here rather than of a connection because the keyspace outlives
-	// any one client; the handlers capture it, and the registry is built from
-	// the same pointer.
-	store *store.Store
-
 	// registry routes decoded commands to handlers. It is set by New and read
 	// by every connection goroutine; a Registry is safe for concurrent use,
 	// which is what makes that sharing safe.
+	//
+	// The keyspace is not a field here. New constructs one store and hands it
+	// to DefaultRegistry, whose handlers close over it, so the registry owns
+	// the only reference the server needs. Keeping a second reference would
+	// be an unread field.
 	//
 	// Tests in this package may replace it with a registry holding their own
 	// handlers.
@@ -130,19 +129,19 @@ type Server struct {
 // port, which is what tests use so they never collide with a real server.
 //
 // The returned Server answers the built-in commands (see
-// commands.DefaultRegistry) against a store it creates here. The store is a
-// field of the Server, not of a connection, which is what makes two clients
-// see each other's writes — the property the keyspace is for.
+// commands.DefaultRegistry) against a store created here. One store is
+// created and handed to the registry, whose handlers close over it, so every
+// connection this server accepts shares one keyspace — the property that
+// makes two clients see each other's writes.
 func New(addr string) *Server {
-	// One store, shared by every connection this server accepts. Constructing
-	// it once and handing the same pointer to the registry is the whole
-	// mechanism by which two clients see each other's writes.
-	s := store.New()
-
+	// Constructing the store once and handing the same pointer to the
+	// registry is the whole mechanism by which two clients see each other's
+	// writes. The server itself never needs to reference it again: no
+	// connection handling touches the keyspace directly, only through a
+	// dispatched command.
 	return &Server{
 		addr:     addr,
-		store:    s,
-		registry: commands.DefaultRegistry(s),
+		registry: commands.DefaultRegistry(store.New()),
 		done:     make(chan struct{}),
 	}
 }

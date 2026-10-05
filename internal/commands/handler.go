@@ -15,18 +15,3 @@ import "github.com/Oussama-Att/verdigris/internal/protocol"
 // which client sent the request. Arguments may alias the connection's read
 // buffer; a handler that retains them must copy, and the store does.
 type Handler func(args []protocol.Value) (protocol.Value, error)
-
-// HandlerError builds the reply for a domain error — something the client did
-// wrong, such as a bad arity or a bad argument type.
-//
-// It returns a Value, not an error, because a domain error is part of the
-// protocol: the client is meant to read it. The internal-fault channel is the
-// Handler's error return, and the two must not be confused. Malformed input
-// is not a server bug, and a server bug is not something to describe to a
-// client.
-//
-// Callers write `return HandlerError(msg), nil`. The nil is the point: no
-// internal fault occurred.
-func HandlerError(msg string) protocol.Value {
-	return protocol.Error(msg)
-}

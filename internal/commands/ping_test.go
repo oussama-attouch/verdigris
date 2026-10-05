@@ -250,19 +250,6 @@ func TestWrongArityMessageMatchesRedisFormat(t *testing.T) {
 	}
 }
 
-// TestHandlerErrorIsAnErrorFrame checks the helper the handlers share.
-func TestHandlerErrorIsAnErrorFrame(t *testing.T) {
-	got := HandlerError("ERR something went wrong")
-
-	errValue, ok := got.(protocol.Error)
-	if !ok {
-		t.Fatalf("HandlerError returned %T, want protocol.Error", got)
-	}
-	if string(errValue) != "ERR something went wrong" {
-		t.Fatalf("HandlerError = %q", errValue)
-	}
-}
-
 // TestHandlersWorkOnDecodedFrames closes the loop between the protocol and
 // command packages without a socket: real RESP bytes are decoded and handed
 // straight to a handler, which is exactly what the server will do.
