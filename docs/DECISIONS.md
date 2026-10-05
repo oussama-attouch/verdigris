@@ -3,6 +3,32 @@
 Every non-obvious choice gets an entry. Format: date · decision · context ·
 alternatives · reason.
 
+## 2026-10-05 — Strict CRLF only; no bare-LF leniency
+
+Context: Real Redis accepts a bare LF on length lines when reading commands,
+a leniency left over from the inline-command era. Our decoder rejects it —
+`\r` must precede every `\n`.
+
+Decision: stay strict. Real clients (redis-cli, all language SDKs) send CRLF
+and nothing else; the lenient path is a Redis compatibility accommodation
+for hand-typed input over telnet, which is not a use case this project has.
+
+If a future milestone discovers a real client that relies on bare-LF, this
+is a deliberate, documented loosening and not an oversight. It is not
+expected to happen.
+
+## 2026-10-05 — Serve does not take a context
+
+Context: `handleConnection` grows a decode loop this milestone. When
+`Shutdown` closes the listener and then the connection, an in-flight read
+returns an error and the handler returns cleanly. The caller does not need
+a per-request cancellation mechanism.
+
+Decision: keep `Serve()` as-is; `Shutdown(ctx)` remains the only
+cancellation surface. Adding `Serve(ctx)` would be redundant — the listener
+close *is* the cancellation signal. Revisit only if a future milestone needs
+mid-handler interruption that closing the connection cannot provide.
+
 ## 2026-10-05 — Fuzz target for the RESP decoder
 
 Context: Milestone 2's hand-written tests found a real overflow bug —

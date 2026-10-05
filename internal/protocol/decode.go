@@ -301,6 +301,17 @@ func decodeArray(c *cursor) (Value, error) {
 	// would turn a nine-byte input into a large allocation. Appending as
 	// elements actually arrive makes memory proportional to bytes received,
 	// which is the only bound worth having on untrusted input.
+	//
+	// The empty case is spelled out rather than left to append: `var out
+	// Array` would decode `*0\r\n` as a nil Array, while the encoded form of
+	// an empty array comes from Array{} — and a non-nil empty slice is a
+	// different value from a nil one in Go. Returning the non-nil empty array
+	// keeps Decode(Encode(Array{})) an identity, which is the property the
+	// encoder's round-trip test relies on.
+	if n == 0 {
+		return Array{}, nil
+	}
+
 	var out Array
 	for i := int64(0); i < n; i++ {
 		// The child's error offset is already in this frame's coordinate

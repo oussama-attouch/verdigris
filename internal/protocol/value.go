@@ -1,5 +1,7 @@
 package protocol
 
+import "strconv"
+
 // Value is a decoded RESP frame. The set of types that implement it is
 // closed: nothing outside this package can meaningfully implement Value,
 // because the unexported method is the seal.
@@ -62,3 +64,21 @@ func (Integer) value()      {}
 func (BulkString) value()   {}
 func (Array) value()        {}
 func (Null) value()         {}
+
+// String returns a human-readable rendering of a value, for log lines, error
+// messages, and test failures.
+//
+// It is deliberately NOT the wire form, and it is lossy: a bulk string is
+// shown in quotes, a null bulk string and a null array are both rendered
+// "null" because RESP2 cannot tell them apart, and a nil slice and an empty
+// slice both render as an empty payload. Use Encode when the bytes matter.
+//
+// The command layer needs this because a client sends a command name as a
+// bulk string — a []byte — and building "ERR unknown command 'FOO'" requires
+// turning that []byte back into text.
+func (v SimpleString) String() string { return string(v) }
+func (v Error) String() string        { return string(v) }
+func (v Integer) String() string      { return strconv.FormatInt(int64(v), 10) }
+func (v BulkString) String() string   { return string(v) }
+func (Array) String() string          { return "[array]" }
+func (Null) String() string           { return "null" }

@@ -4,11 +4,16 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/Oussama-Att/verdigris/internal/commands"
+	"github.com/Oussama-Att/verdigris/internal/protocol"
 )
 
 // DefaultPort is the TCP port Verdigris listens on by default. 6379 is
@@ -22,8 +27,34 @@ const DefaultPort = 6379
 // pressing Ctrl-C while being long enough that a stuck handler costs nothing.
 const drainPollInterval = 5 * time.Millisecond
 
-// Server is a TCP server that echoes every line it reads back to the client
-// that sent it.
+// maxFrameSize bounds a single accumulated frame, in bytes.
+//
+// Without a bound, a client can send a bulk-string header declaring gigabytes
+// and then dribble bytes forever: Decode keeps reporting ErrIncomplete, the
+// accumulation buffer keeps growing, and one connection consumes all the
+// memory on the machine. The declaration is not trustworthy — it is attacker
+// input — so the ceiling is enforced on what has actually arrived.
+//
+// Redis's own proto-max-bulk-len defaults to 512 MB. This is deliberately
+// smaller: nothing PING and ECHO can carry needs more, and the limit can be
+// raised when a later milestone has commands whose payloads justify it.
+const maxFrameSize = 64 << 20 // 64 MiB
+
+// errFrameTooLarge reports a client that has sent more bytes without
+// completing a frame than maxFrameSize allows. It is a sentinel so the check
+// can be recognised, and it is deliberately phrased like the protocol
+// package's errors because that is how it reaches the client: an ERR reply
+// followed by a closed connection.
+var errFrameTooLarge = errors.New("frame exceeds the configured limit")
+
+// readBufSize is the size of the stack buffer a handler fills per read, in
+// bytes. It is a starting point rather than a frame limit: the per-connection
+// accumulation buffer grows past it for a large command, and a command may
+// also span several reads.
+const readBufSize = 4096
+
+// Server is a TCP server that speaks RESP: it decodes requests, dispatches
+// them through a command registry, and encodes the replies.
 //
 // A zero-value Server is not usable: it has no channels and no connection
 // table. Always construct one with New.
@@ -31,6 +62,14 @@ type Server struct {
 	// addr is the address passed to New, kept so Listen can report it and so
 	// the binding decision is made in exactly one place.
 	addr string
+
+	// registry routes decoded commands to handlers. It is set by New and read
+	// by every connection goroutine; a Registry is safe for concurrent use,
+	// which is what makes that sharing safe.
+	//
+	// Tests in this package may replace it with a registry holding their own
+	// handlers.
+	registry *commands.Registry
 
 	// mu guards ln. It is written by Listen and read by Serve, Addr, and
 	// Shutdown, which may all run on different goroutines — cmd/verdigris
@@ -82,10 +121,14 @@ type Server struct {
 //
 // addr is in net.Listen's "host:port" form. ":0" asks the kernel for a free
 // port, which is what tests use so they never collide with a real server.
+//
+// The returned Server answers the built-in commands (see
+// commands.DefaultRegistry).
 func New(addr string) *Server {
 	return &Server{
-		addr: addr,
-		done: make(chan struct{}),
+		addr:     addr,
+		registry: commands.DefaultRegistry(),
+		done:     make(chan struct{}),
 	}
 }
 
@@ -220,12 +263,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 }
 
-// handleConnection serves exactly one client connection until it ends.
-//
-// net.Conn is not safe for concurrent use, so this connection is owned by
-// this goroutine for its whole life and is never touched by another one —
-// with the deliberate exception of Shutdown closing it to break a blocked
-// read, which the net package documents as safe.
+// handleConnection owns one client connection for its whole life: setup, the
+// read/dispatch loop, and teardown. It is the thinnest possible shell around
+// readCommands; everything below it is a detail of reading, decoding, or
+// cleanup rather than part of the loop's shape.
 func (s *Server) handleConnection(conn net.Conn) {
 	remote := conn.RemoteAddr().String()
 	log.Printf("accepted %s", remote)
@@ -238,58 +279,164 @@ func (s *Server) handleConnection(conn net.Conn) {
 		log.Printf("closed %s", remote)
 	}()
 
-	// Nagle's algorithm holds small writes back to coalesce them. This
-	// server writes one line per line read, so Nagle would only add latency
-	// and buy nothing. Redis disables it on client sockets for the same
-	// reason.
+	// Nagle's algorithm holds small writes back to coalesce them. This server
+	// writes one reply per command, so Nagle would add latency to every
+	// round trip and buy nothing. Redis disables it on client sockets for the
+	// same reason.
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
 	}
 
-	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
+	readCommands(remote, bufio.NewReader(conn), bufio.NewWriter(conn), s.registry)
+}
+
+// readCommands is the loop: read bytes, decode one frame, dispatch it, encode
+// the reply, write it, repeat. It returns when the client disconnects or the
+// stream desynchronizes, and it never interprets a command — that is the
+// registry's job.
+//
+// It is a free function rather than a method because it needs exactly three
+// things: where to read, where to write, and who decides. That makes the
+// shape of the loop readable on its own, and testable without a Server.
+func readCommands(remote string, reader *bufio.Reader, writer *bufio.Writer, registry *commands.Registry) {
+	chunk := make([]byte, readBufSize)
+
+	// buf accumulates bytes that have arrived but do not yet form a complete
+	// frame. It is per-connection state, which is what makes it correct: RESP
+	// frames are length-prefixed, so a frame may be split across any number of
+	// reads at any byte offset, chosen by the network.
+	//
+	// It starts nil and is appended into, so memory is allocated on first use
+	// at the size of the data actually received rather than a guess made at
+	// connect time.
+	var buf []byte
 
 	for {
-		// ReadBytes, not ReadString: RESP bulk strings are binary-safe, and
-		// converting to a string here would hide the raw bytes behind UTF-8
-		// semantics before anything has had a chance to inspect them.
+		// Decode as many complete frames as the buffer holds. A client is
+		// allowed to send several commands in one write — pipelining — and
+		// each one must be answered in order.
 		//
-		// ReadBytes('\n') also makes partial reads a non-issue. Whatever has
-		// arrived so far is buffered and returned only once the terminator is
-		// seen, so a line split across TCP segments is reassembled before the
-		// handler looks at it.
-		line, err := reader.ReadBytes('\n')
+		// incomplete is a loop-carried flag rather than a plain break, because
+		// "the buffer is empty" and "the buffer holds a partial frame" both
+		// mean read more, while "the buffer holds a whole frame" means handle
+		// it and try again. Collapsing the first two into one break would
+		// leave a partial frame being re-decoded forever without ever reading
+		// the bytes that would complete it.
+		incomplete := false
 
-		if len(line) > 0 {
-			// Write the exact bytes that were read, terminator included.
-			// Writing line plus a fresh "\r\n" would double the terminator,
-			// and trimming it (as ReadString callers often do) would corrupt
-			// the framing milestone 2 depends on.
-			if _, writeErr := writer.Write(line); writeErr != nil {
+		for len(buf) > 0 {
+			value, n, err := protocol.Decode(buf)
+
+			if errors.Is(err, protocol.ErrIncomplete) {
+				incomplete = true
+				break
+			}
+
+			if err != nil {
+				// A grammar violation is terminal for the connection. The
+				// bytes cannot become valid by waiting, so tell the client
+				// what was wrong and hang up rather than leaving it guessing.
+				log.Printf("protocol error from %s: %v", remote, err)
+				_ = writeReply(writer, protocol.Error("ERR Protocol error: "+err.Error()))
+				return
+			}
+
+			// Advance past this frame before handling it, so buf is already
+			// correct for the next iteration whatever the handler does.
+			buf = buf[n:]
+
+			// The reply is encoded and written before the next read, which is
+			// what makes it safe for a handler to return a bulk string that
+			// aliases buf: nothing overwrites those bytes until the reply has
+			// left the process.
+			if writeErr := writeReply(writer, registry.Dispatch(value)); writeErr != nil {
 				log.Printf("write to %s: %v", remote, writeErr)
 				return
 			}
-			// Flush per line. A buffered writer without an explicit flush
-			// would hold the echo until the buffer filled or the connection
-			// closed, which turns an echo server into a silent one.
-			if flushErr := writer.Flush(); flushErr != nil {
-				log.Printf("write to %s: %v", remote, flushErr)
-				return
-			}
 		}
 
+		// Read more when there is nothing left to decode: either the buffer is
+		// empty because every frame in it was handled, or it holds a partial
+		// frame that needs the rest of its bytes.
+		if len(buf) != 0 && !incomplete {
+			continue
+		}
+
+		read, err := readChunk(reader, chunk, len(buf))
+		if read > 0 {
+			buf = append(buf, chunk[:read]...)
+			continue
+		}
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				// The client disconnected cleanly. That is the normal way a
-				// connection ends, not a fault, so nothing is logged.
-				return
+			if !isClientDisconnect(err) {
+				log.Printf("read from %s: %v", remote, err)
 			}
-			// Anything else is a real failure. It is logged once here and
-			// nowhere else, then this handler gives up on this connection.
-			log.Printf("read from %s: %v", remote, err)
+			// A client disconnect is the normal way a connection ends. A
+			// partial frame left in buf is discarded: there is no reply to
+			// send, because the request never finished.
 			return
 		}
 	}
+}
+
+// readChunk reads the next piece of a request into chunk, returning the
+// number of bytes read.
+//
+// Its one job beyond calling Read is enforcing maxFrameSize. The check runs
+// before the read, so the buffer is never allowed to grow past the ceiling
+// even temporarily, and it reports the overflow as a protocol error so the
+// loop above treats it like any other desynchronized stream: answer, close.
+func readChunk(reader *bufio.Reader, chunk []byte, buffered int) (int, error) {
+	if buffered >= maxFrameSize {
+		return 0, fmt.Errorf("%w: frame exceeds the %d-byte limit", errFrameTooLarge, maxFrameSize)
+	}
+	if buffered+len(chunk) > maxFrameSize {
+		chunk = chunk[:maxFrameSize-buffered]
+	}
+	return reader.Read(chunk)
+}
+
+// isClientDisconnect reports whether a read error is just the client going
+// away, which is not worth logging.
+//
+// io.EOF is the polite close. The other case is a connection reset, and it
+// matters in practice: redis-cli sends its command, reads the reply, and then
+// resets the socket rather than half-closing it. On Windows that surfaces as
+// WSAECONNRESET — "An existing connection was forcibly closed by the remote
+// host" — and on Unix as ECONNRESET. Logging it would print an alarming line
+// for every single command a user runs, which is worse than useless: it
+// trains the reader to ignore the log.
+//
+// The check is by error string rather than syscall.Errno, because the
+// platform-specific errno values differ and syscall.ECONNRESET is not
+// portable across Windows and Unix builds without build-tagged files. A
+// string match is coarse but safe here: the cost of a false positive is one
+// unlogged disconnect, and the cost of a false negative is log noise.
+func isClientDisconnect(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "forcibly closed") || // Windows
+		strings.Contains(msg, "connection reset by peer") // Unix
+}
+
+// writeReply encodes a reply and flushes it, so the client sees it without
+// waiting for the connection to close or the buffer to fill. A buffered
+// writer without an explicit flush would make the server appear to hang.
+func writeReply(writer *bufio.Writer, reply protocol.Value) error {
+	// Encode returns nil only for a nil Value, which no handler should
+	// produce. Writing nothing would leave the client waiting for a reply
+	// that is never coming, so it is turned into an error frame instead.
+	encoded := protocol.Encode(reply)
+	if encoded == nil {
+		encoded = protocol.Encode(protocol.Error("ERR internal error: no reply"))
+	}
+
+	if _, err := writer.Write(encoded); err != nil {
+		return err
+	}
+	return writer.Flush()
 }
 
 // anyActive reports whether any connection is still being handled.

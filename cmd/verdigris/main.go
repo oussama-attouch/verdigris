@@ -17,7 +17,7 @@ import (
 // version is a placeholder. It will be populated from build metadata in a
 // later milestone. For now it exists so the binary has something to print
 // and so the build can be verified end to end.
-const version = "0.1.0-milestone1"
+const version = "0.2.0-milestone3"
 
 // shutdownTimeout bounds how long a graceful shutdown may take before
 // in-flight connections are cut off.

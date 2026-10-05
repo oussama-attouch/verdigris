@@ -4,9 +4,10 @@ A Redis-compatible key-value store, written from scratch in Go.
 
 ## Status
 
-Milestones 1–2 complete. The server accepts raw TCP connections and echoes
-bytes back verbatim. The RESP decoder is implemented and tested. No RESP
-encoder yet, no data store, no commands.
+Milestones 1–3 complete. The server speaks RESP: it decodes commands,
+dispatches them through a registry, and encodes the replies. `PING` and `ECHO`
+work, verified against the real `redis-cli`. No data store, no persistence,
+and no commands beyond those two.
 
 ## Why
 
@@ -43,17 +44,28 @@ go run ./cmd/verdigris              # listens on :6379
 go run ./cmd/verdigris -port 7000
 ```
 
-The server echoes each line it reads, so any raw TCP client will demonstrate
-it. Windows ships no `nc`, so one way to try it is PowerShell's `TcpClient`:
+The server speaks RESP, so the real client is the right way to try it:
+
+```bash
+redis-cli PING                       # PONG
+redis-cli ECHO "hello verdigris"     # "hello verdigris"
+redis-cli PING "custom message"      # "custom message"
+redis-cli NOTACOMMAND                # (error) ERR unknown command 'NOTACOMMAND'
+redis-cli ECHO                       # (error) ERR wrong number of arguments for 'echo' command
+```
+
+Command names are case-insensitive, as they are in Redis. Any RESP client
+works, not just `redis-cli`; on Windows without one, PowerShell's `TcpClient`
+can send the raw bytes:
 
 ```powershell
 $c = New-Object System.Net.Sockets.TcpClient('127.0.0.1', 6379)
 $s = $c.GetStream()
-$msg = [Text.Encoding]::ASCII.GetBytes("hello verdigris`r`n")
+$msg = [Text.Encoding]::ASCII.GetBytes("*1`r`n`$4`r`nPING`r`n")
 $s.Write($msg, 0, $msg.Length)
 $buf = New-Object byte[] 64
 $n = $s.Read($buf, 0, 64)
-[Text.Encoding]::ASCII.GetString($buf, 0, $n)   # prints hello verdigris
+[Text.Encoding]::ASCII.GetString($buf, 0, $n)   # prints +PONG
 $c.Close()
 ```
 
