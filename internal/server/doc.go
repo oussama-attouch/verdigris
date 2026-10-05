@@ -1,14 +1,17 @@
 // Package server owns the network layer: the TCP listener, the accept loop,
-// per-client connection state, and the event loop that dispatches readable
-// connections to the protocol and command layers.
+// per-client connection lifecycle, and graceful shutdown.
 //
 // This package is responsible for sockets, buffering, connection lifecycle,
-// and the single-threaded event loop that mirrors Redis's own design. It is
-// NOT responsible for parsing RESP frames (see package protocol), for
-// holding key-value data or expiry (see package store), or for deciding what
-// any command means (see package commands). The server moves bytes and
+// and running one handler goroutine per accepted connection. It is NOT
+// responsible for parsing RESP frames (see package protocol), for holding
+// key-value data or expiry (see package store), or for deciding what any
+// command means (see package commands). The server moves bytes and
 // coordinates; it does not interpret them.
 //
-// Milestone 1 will implement the TCP echo server. Until then, the package
-// contains no exported symbols.
+// Milestone 1 implements the echo server: every byte read from a connection
+// is written straight back. That is a placeholder, not the design. From
+// milestone 2 onward, handler will hand its buffer to the protocol package
+// and write whatever the command layer produces. Nothing else in this package
+// needs to change to make that swap — which is the point of keeping the
+// handler's body to a single, obvious function call.
 package server

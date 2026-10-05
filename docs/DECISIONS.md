@@ -3,6 +3,22 @@
 Every non-obvious choice gets an entry. Format: date · decision · context ·
 alternatives · reason.
 
+## 2026-10-05 — Concurrency model: goroutine per connection
+
+Context: Redis is single-threaded with an epoll/kqueue event loop. Go is built
+around blocking sockets with goroutines. Writing an epoll-based event loop in
+Go is possible (via syscall or golang.org/x/sys) but fights the language and
+adds significant complexity to milestone 1.
+
+Alternatives: single-threaded epoll loop (Redis-faithful, higher cost, more
+subtle bugs); a fixed worker pool (unnecessary for this project's scale).
+
+Reason: goroutine per connection is what Go is designed for, and it delivers
+correct concurrent connection handling with less code. The store's design
+(a mutex around the map) makes the concurrency model invisible to milestones
+2–5. If milestone 8's benchmarks show the goroutine model is the bottleneck,
+the event loop can be revisited then — and the store won't need to change.
+
 ## 2026-10-05 — Language: Go
 
 Context: The project needs raw sockets, concurrency primitives, and a

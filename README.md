@@ -4,8 +4,9 @@ A Redis-compatible key-value store, written from scratch in Go.
 
 ## Status
 
-Early development. The binary builds and prints a version string. No
-networking, no protocol parsing, no commands yet.
+Milestone 1 complete. The server accepts raw TCP connections and echoes
+bytes back verbatim, line by line. No RESP parsing, no data store, no
+commands yet.
 
 ## Why
 
@@ -34,6 +35,30 @@ See [docs/ROADMAP.md](docs/ROADMAP.md).
 go build ./...
 go run ./cmd/verdigris
 ```
+
+## Running
+
+```bash
+go run ./cmd/verdigris              # listens on :6379
+go run ./cmd/verdigris -port 7000
+```
+
+The server echoes each line it reads, so any raw TCP client will demonstrate
+it. Windows ships no `nc`, so one way to try it is PowerShell's `TcpClient`:
+
+```powershell
+$c = New-Object System.Net.Sockets.TcpClient('127.0.0.1', 6379)
+$s = $c.GetStream()
+$msg = [Text.Encoding]::ASCII.GetBytes("hello verdigris`r`n")
+$s.Write($msg, 0, $msg.Length)
+$buf = New-Object byte[] 64
+$n = $s.Read($buf, 0, 64)
+[Text.Encoding]::ASCII.GetString($buf, 0, $n)   # prints hello verdigris
+$c.Close()
+```
+
+Stop it with Ctrl-C; the server closes the listener, waits for in-flight
+connections, and exits 0. `-port` outside 1–65535 prints usage and exits 2.
 
 ## License
 
