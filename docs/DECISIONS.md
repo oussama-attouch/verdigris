@@ -3,6 +3,25 @@
 Every non-obvious choice gets an entry. Format: date · decision · context ·
 alternatives · reason.
 
+## 2026-10-05 — Race detector enabled via user-level MinGW-w64
+
+Context: go test -race requires cgo, which requires a C compiler. Chocolatey
+cannot install one in this environment (unelevated session, approval prompts
+disabled), and winget is not present. The race detector is the single most
+valuable tool for the concurrency-sensitive milestones ahead — the store's
+mutex in milestone 4, the AOF flush in milestone 7, and the connection
+tracking that is already in place.
+
+Alternatives: MinGW-w64 via chocolatey (unusable here); MSVC via Visual Studio
+Build Tools (multi-GB install, overkill for cgo); WSL gcc (WSL enumeration is
+access-denied on this machine).
+
+Reason: winlibs.com's UCRT/POSIX/SEH build is a self-contained zip that
+extracts under %LOCALAPPDATA%\Programs\mingw64 with no administrator rights,
+matches the pattern already used for the Go install, and is trivially
+reversible by deleting the directory and removing one PATH entry. gcc on PATH
+plus CGO_ENABLED=1 enables the race detector everywhere without admin access.
+
 ## 2026-10-05 — Concurrency model: goroutine per connection
 
 Context: Redis is single-threaded with an epoll/kqueue event loop. Go is built
