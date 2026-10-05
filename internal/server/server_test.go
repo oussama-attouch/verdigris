@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -904,4 +905,474 @@ func TestReadChunkEnforcesFrameLimit(t *testing.T) {
 			t.Fatalf("readChunk read %d bytes, want all %d of the payload", n, len(payload))
 		}
 	})
+}
+
+// --- Milestone 4: the store, over a real socket -----------------------------
+
+// TestSetGetRoundTripOverTCP is the milestone's acceptance criterion, exercised
+// through the whole stack: bytes on a socket, decoded, dispatched to a handler
+// that touches the store, encoded, and written back.
+func TestSetGetRoundTripOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(commandFrame("SET", "foo", "bar"))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(commandFrame("GET", "foo"))
+	c.expect(protocol.BulkString([]byte("bar")))
+}
+
+// TestGetMissingKeyOverTCP pins the wire reply for a miss: `$-1\r\n`, which is
+// what makes redis-cli print (nil).
+func TestGetMissingKeyOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+	c.send(commandFrame("GET", "nothere"))
+
+	c.expect(protocol.Null{})
+}
+
+// TestDelOverTCP checks both answers: one for a key that existed and zero for
+// the second delete of the same key.
+func TestDelOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(commandFrame("SET", "k", "v"))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(commandFrame("DEL", "k"))
+	c.expect(protocol.Integer(1))
+
+	c.send(commandFrame("DEL", "k"))
+	c.expect(protocol.Integer(0))
+}
+
+// TestExistsOverTCP checks an existing key, a missing one, and the duplicate
+// quirk that makes EXISTS a count of arguments rather than of distinct keys.
+func TestExistsOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(commandFrame("SET", "k", "v"))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(commandFrame("EXISTS", "k"))
+	c.expect(protocol.Integer(1))
+
+	c.send(commandFrame("EXISTS", "nothere"))
+	c.expect(protocol.Integer(0))
+
+	c.send(commandFrame("EXISTS", "k", "k", "nothere"))
+	c.expect(protocol.Integer(2))
+}
+
+// TestSetOverwriteOverTCP checks the second SET wins, which is the case the
+// milestone's demo walks through with redis-cli.
+func TestSetOverwriteOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(commandFrame("SET", "foo", "bar"))
+	c.expect(protocol.SimpleString("OK"))
+	c.send(commandFrame("GET", "foo"))
+	c.expect(protocol.BulkString([]byte("bar")))
+
+	c.send(commandFrame("SET", "foo", "baz"))
+	c.expect(protocol.SimpleString("OK"))
+	c.send(commandFrame("GET", "foo"))
+	c.expect(protocol.BulkString([]byte("baz")))
+}
+
+// TestDelMultipleKeysOverTCP covers the three-key form where one is absent:
+// DEL k1 k2 k3 answers 2.
+func TestDelMultipleKeysOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(commandFrame("SET", "k1", "v1"))
+	c.expect(protocol.SimpleString("OK"))
+	c.send(commandFrame("SET", "k2", "v2"))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(commandFrame("DEL", "k1", "k2", "k3"))
+	c.expect(protocol.Integer(2))
+}
+
+// TestMultipleClientsShareStoreOverTCP is the point of the shared store, and
+// the test that makes "the store lives in the server, not in the connection"
+// observable. Two independent connections: one writes, the other reads.
+//
+// A store constructed per connection would pass every single-client test in
+// this file and fail exactly here.
+func TestMultipleClientsShareStoreOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	writer := newClient(t, addr)
+	reader := newClient(t, addr)
+
+	writer.send(commandFrame("SET", "shared-key", "written by A"))
+	writer.expect(protocol.SimpleString("OK"))
+
+	// A different socket must see it.
+	reader.send(commandFrame("GET", "shared-key"))
+	reader.expect(protocol.BulkString([]byte("written by A")))
+
+	reader.send(commandFrame("EXISTS", "shared-key"))
+	reader.expect(protocol.Integer(1))
+
+	// And a delete from the reader must be visible to the writer.
+	reader.send(commandFrame("DEL", "shared-key"))
+	reader.expect(protocol.Integer(1))
+
+	writer.send(commandFrame("EXISTS", "shared-key"))
+	writer.expect(protocol.Integer(0))
+}
+
+// TestStoreIsSharedAcrossConcurrentClients is the milestone's concurrency
+// proof at the server level: eight clients, each writing fifty keys, all at
+// the same time on separate sockets, and then a ninth client verifying that
+// every one of the four hundred keys is present.
+//
+// It runs under -race, which is the real assertion. A store whose mutex was
+// missing, too narrow, or held across the wrong section would corrupt here —
+// and a per-connection store would fail the verification pass.
+func TestStoreIsSharedAcrossConcurrentClients(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	const clients = 8
+	const keysPerClient = 50
+
+	// Each goroutine dials its own connection and writes its own key range.
+	// The keys share a prefix, so they all live in one namespace and a missing
+	// one is a real loss rather than a different namespace.
+	var wg sync.WaitGroup
+	errs := make(chan error, clients)
+
+	for c := 0; c < clients; c++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				errs <- fmt.Errorf("client %d dial: %w", c, err)
+				return
+			}
+			defer conn.Close()
+
+			if err := conn.SetDeadline(time.Now().Add(testTimeout)); err != nil {
+				errs <- fmt.Errorf("client %d deadline: %w", c, err)
+				return
+			}
+
+			// Write every key, then read each one back on this same
+			// connection, which at least proves the writes were accepted.
+			for k := 0; k < keysPerClient; k++ {
+				frame := commandFrame("SET",
+					fmt.Sprintf("key-%d-%d", c, k),
+					fmt.Sprintf("value-%d-%d", c, k))
+
+				if err := writeAll(conn, frame); err != nil {
+					errs <- fmt.Errorf("client %d SET %d: %w", c, k, err)
+					return
+				}
+				reply, err := readOne(conn)
+				if err != nil {
+					errs <- fmt.Errorf("client %d SET %d reply: %w", c, k, err)
+					return
+				}
+				if reply != protocol.SimpleString("OK") {
+					errs <- fmt.Errorf("client %d SET %d got %#v, want OK", c, k, reply)
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("concurrent writer: %v", err)
+	}
+
+	// A fresh client must see every key, written by any of the eight.
+	verifier := newClient(t, addr)
+
+	for c := 0; c < clients; c++ {
+		for k := 0; k < keysPerClient; k++ {
+			key := fmt.Sprintf("key-%d-%d", c, k)
+			want := fmt.Sprintf("value-%d-%d", c, k)
+
+			verifier.send(commandFrame("GET", key))
+			verifier.expect(protocol.BulkString([]byte(want)))
+		}
+	}
+
+	// And the count must be exactly what was written, so no key was lost and
+	// none was duplicated into existence.
+	var existed int64
+	for c := 0; c < clients; c++ {
+		for k := 0; k < keysPerClient; k++ {
+			verifier.send(commandFrame("EXISTS", fmt.Sprintf("key-%d-%d", c, k)))
+			got := verifier.next()
+
+			n, ok := got.(protocol.Integer)
+			if !ok {
+				t.Fatalf("EXISTS returned %#v (%T), want Integer", got, got)
+			}
+			existed += int64(n)
+		}
+	}
+
+	if want := int64(clients * keysPerClient); existed != want {
+		t.Fatalf("EXISTS counted %d keys, want %d", existed, want)
+	}
+}
+
+// TestWriteThenReadAcrossManyConnections checks that a key written on one
+// connection is readable on a connection opened afterwards, which is the
+// weakest form of sharing and the one a per-connection store would fail.
+func TestWriteThenReadAcrossManyConnections(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	for i := 0; i < 10; i++ {
+		c := newClient(t, addr)
+		c.send(commandFrame("SET", fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i)))
+		c.expect(protocol.SimpleString("OK"))
+	}
+
+	for i := 0; i < 10; i++ {
+		c := newClient(t, addr)
+		c.send(commandFrame("GET", fmt.Sprintf("k%d", i)))
+		c.expect(protocol.BulkString([]byte(fmt.Sprintf("v%d", i))))
+	}
+}
+
+// TestClientSetInfoIsNoOpOverTCP checks the compatibility reply modern Redis
+// clients expect on connect.
+func TestClientSetInfoIsNoOpOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(commandFrame("CLIENT", "SETINFO", "lib-name", "test"))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(commandFrame("CLIENT", "SETINFO", "lib-ver", "1.0.0"))
+	c.expect(protocol.SimpleString("OK"))
+
+	// An unimplemented subcommand must still be refused.
+	c.send(commandFrame("CLIENT", "GETNAME"))
+	c.mustError()
+}
+
+// TestCommandProbeOverTCP checks the stub reply a client probing for command
+// metadata receives.
+func TestCommandProbeOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(commandFrame("COMMAND", "DOCS"))
+	c.expect(protocol.Array{})
+
+	// The bare form and an unknown subcommand answer the same way.
+	c.send(commandFrame("COMMAND"))
+	c.expect(protocol.Array{})
+}
+
+// TestStoreSurvivesClientDisconnect checks the store outlives the connection
+// that wrote to it, which is the same property as sharing but stated in the
+// direction that a connection-scoped store would fail most obviously.
+func TestStoreSurvivesClientDisconnect(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	writer := newClient(t, addr)
+	writer.send(commandFrame("SET", "persistent", "value"))
+	writer.expect(protocol.SimpleString("OK"))
+	if err := writer.conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// A brand new connection must still see the key.
+	reader := newClient(t, addr)
+	reader.send(commandFrame("GET", "persistent"))
+	reader.expect(protocol.BulkString([]byte("value")))
+}
+
+// TestBinarySafeSetGetOverTCP stores and retrieves bytes that are not text,
+// including CRLF, over the wire. This is the case where a length-prefixed
+// protocol earns its keep, and where a store that converted keys or values to
+// text would corrupt the data.
+func TestBinarySafeSetGetOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	key := []byte{0x00, 0xff, '\r', '\n'}
+	value := []byte{0xff, 0x00, '\r', '\n', 0xfe, '$', '*'}
+
+	c := newClient(t, addr)
+
+	c.send(commandFrame("SET", string(key), string(value)))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(commandFrame("GET", string(key)))
+	c.expect(protocol.BulkString(value))
+
+	// A value containing command bytes must come back untouched, not parsed.
+	c.send(commandFrame("GET", string(key)))
+	got := c.next()
+	bs, ok := got.(protocol.BulkString)
+	if !ok {
+		t.Fatalf("GET = %T, want BulkString", got)
+	}
+	if !bytes.Equal(bs, value) {
+		t.Fatalf("GET = % x, want % x", bs, value)
+	}
+}
+
+// TestEmptyValueIsDistinctFromMissingOverTCP is the wire-level half of the
+// nil-versus-empty distinction: `$0\r\n\r\n` for a stored empty value and
+// `$-1\r\n` for an absent key. A client branches on which it receives.
+func TestEmptyValueIsDistinctFromMissingOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(commandFrame("SET", "empty", ""))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(commandFrame("GET", "empty"))
+	got := c.next()
+	bs, ok := got.(protocol.BulkString)
+	if !ok {
+		t.Fatalf("GET of a stored empty value = %#v (%T), want BulkString", got, got)
+	}
+	if bs == nil {
+		t.Fatal("GET of a stored empty value returned nil, want an empty bulk string")
+	}
+	if len(bs) != 0 {
+		t.Fatalf("GET of a stored empty value = %q, want empty", bs)
+	}
+
+	c.send(commandFrame("GET", "absent"))
+	c.expect(protocol.Null{})
+}
+
+// TestPipelinedStoreCommandsOverTCP sends a whole transaction's worth of
+// commands in one write and checks each reply in order. Pipelining is where a
+// store shared between connections and a per-connection read loop have to
+// agree about ordering.
+func TestPipelinedStoreCommandsOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	var batch []byte
+	batch = append(batch, commandFrame("SET", "a", "1")...)
+	batch = append(batch, commandFrame("SET", "b", "2")...)
+	batch = append(batch, commandFrame("GET", "a")...)
+	batch = append(batch, commandFrame("GET", "b")...)
+	batch = append(batch, commandFrame("EXISTS", "a", "b")...)
+	batch = append(batch, commandFrame("DEL", "a", "b")...)
+	batch = append(batch, commandFrame("GET", "a")...)
+
+	c.send(batch)
+
+	c.expectAll(
+		protocol.SimpleString("OK"),
+		protocol.SimpleString("OK"),
+		protocol.BulkString([]byte("1")),
+		protocol.BulkString([]byte("2")),
+		protocol.Integer(2),
+		protocol.Integer(2),
+		protocol.Null{},
+	)
+}
+
+// TestStoreErrorDoesNotCloseConnectionOverTCP checks that a domain error from
+// a store command leaves the connection usable, unlike a protocol error. A
+// client that mistyped one command should be able to send the next.
+func TestStoreErrorDoesNotCloseConnectionOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	// Wrong arity: a client error, not a desynchronized stream.
+	c.send(commandFrame("SET", "onlykey"))
+	c.mustError()
+
+	// The connection must still work.
+	c.send(commandFrame("SET", "k", "v"))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(commandFrame("GET", "k"))
+	c.expect(protocol.BulkString([]byte("v")))
+}
+
+// writeAll writes a whole frame, retrying short writes. A single Write on a
+// TCP socket may accept fewer bytes than it was given.
+func writeAll(conn net.Conn, frame []byte) error {
+	for len(frame) > 0 {
+		n, err := conn.Write(frame)
+		if err != nil {
+			return err
+		}
+		frame = frame[n:]
+	}
+	return nil
+}
+
+// readOne reads exactly one RESP frame off a connection, decoding as bytes
+// arrive. It is the goroutine-safe counterpart of client.next: no *testing.T,
+// because it runs from worker goroutines.
+func readOne(conn net.Conn) (protocol.Value, error) {
+	var acc []byte
+	chunk := make([]byte, 512)
+
+	for {
+		value, n, err := protocol.Decode(acc)
+		if err == nil {
+			if n != len(acc) {
+				return nil, fmt.Errorf("reply had %d trailing bytes", len(acc)-n)
+			}
+			return value, nil
+		}
+		if !errors.Is(err, protocol.ErrIncomplete) {
+			return nil, fmt.Errorf("reply did not decode: %w", err)
+		}
+
+		read, readErr := conn.Read(chunk)
+		if read > 0 {
+			acc = append(acc, chunk[:read]...)
+			continue
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
 }

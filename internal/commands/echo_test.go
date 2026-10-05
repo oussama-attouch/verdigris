@@ -6,11 +6,15 @@ import (
 	"testing"
 
 	"github.com/Oussama-Att/verdigris/internal/protocol"
+	"github.com/Oussama-Att/verdigris/internal/store"
 )
 
 // TestEchoHappyPath is the plain case the milestone's demo relies on.
 func TestEchoHappyPath(t *testing.T) {
-	got := Echo(args("ECHO", "hello verdigris"))
+	got, fault := Echo(args("ECHO", "hello verdigris"))
+	if fault != nil {
+		t.Fatalf("Echo reported an internal fault: %v", fault)
+	}
 
 	want := protocol.BulkString([]byte("hello verdigris"))
 	if !reflect.DeepEqual(got, want) {
@@ -36,7 +40,10 @@ func TestEchoWrongArity(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Echo(tt.args)
+			got, fault := Echo(tt.args)
+			if fault != nil {
+				t.Fatalf("Echo(%v) reported an internal fault: %v", tt.args, fault)
+			}
 
 			errValue, ok := got.(protocol.Error)
 			if !ok {
@@ -53,7 +60,10 @@ func TestEchoWrongArity(t *testing.T) {
 // message". The first is an arity error; the second is a legitimate request
 // for an empty bulk string, and the reply is `$0\r\n\r\n`, not a null.
 func TestEchoEmptyMessageIsNotAnError(t *testing.T) {
-	got := Echo(args("ECHO", ""))
+	got, fault := Echo(args("ECHO", ""))
+	if fault != nil {
+		t.Fatalf("Echo reported an internal fault: %v", fault)
+	}
 
 	if _, isErr := got.(protocol.Error); isErr {
 		t.Fatalf("Echo with an empty message returned an error: %#v", got)
@@ -93,7 +103,10 @@ func TestEchoRejectsNonBulkMessage(t *testing.T) {
 
 	for _, in := range inputs {
 		t.Run(commandsTypeName(in), func(t *testing.T) {
-			got := Echo([]protocol.Value{protocol.BulkString([]byte("ECHO")), in})
+			got, fault := Echo([]protocol.Value{protocol.BulkString([]byte("ECHO")), in})
+			if fault != nil {
+				t.Fatalf("Echo reported an internal fault: %v", fault)
+			}
 
 			errValue, ok := got.(protocol.Error)
 			if !ok {
@@ -126,7 +139,10 @@ func TestEchoRoundTripsThroughTheWire(t *testing.T) {
 		t.Fatalf("Decode consumed %d of %d bytes", n, len(wire))
 	}
 
-	reply := DefaultRegistry().Dispatch(decoded)
+	reply, fault := DefaultRegistry(store.New()).Dispatch(decoded)
+	if fault != nil {
+		t.Fatalf("Dispatch reported an internal fault: %v", fault)
+	}
 
 	const want = "$15\r\nhello verdigris\r\n"
 	if got := string(protocol.Encode(reply)); got != want {
@@ -152,7 +168,10 @@ func TestEchoBinarySafeThroughTheWire(t *testing.T) {
 		t.Fatalf("Decode error: %v", err)
 	}
 
-	reply := DefaultRegistry().Dispatch(decoded)
+	reply, fault := DefaultRegistry(store.New()).Dispatch(decoded)
+	if fault != nil {
+		t.Fatalf("Dispatch reported an internal fault: %v", fault)
+	}
 	replyWire := protocol.Encode(reply)
 
 	// Decoding the reply must give back exactly the payload that went in.

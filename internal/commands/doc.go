@@ -11,6 +11,14 @@
 // never touches a connection directly. Keeping it that way is what makes
 // every command unit-testable without a socket.
 //
-// Milestone 3 registers the first two handlers, PING and ECHO. SET, GET,
-// DEL, EXISTS, EXPIRE and TTL arrive with the store in milestones 4 and 5.
+// Milestone 4 brings the registry to eight commands: PING, ECHO, SET, GET,
+// DEL, EXISTS, plus CLIENT and COMMAND, which exist so that modern Redis
+// clients and probing tools connect quietly rather than seeing errors they
+// cannot act on. EXPIRE and TTL arrive with expiration in milestone 5.
+//
+// A handler returns (Value, error). The Value is the reply and is always sent
+// to the client; the error is an internal fault, which the server logs and
+// replaces with a generic message rather than forwarding. Domain errors —
+// wrong arity, a bad argument type, an unknown command — are protocol.Error
+// values with a nil error, because the client is meant to read them.
 package commands

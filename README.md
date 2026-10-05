@@ -4,10 +4,11 @@ A Redis-compatible key-value store, written from scratch in Go.
 
 ## Status
 
-Milestones 1–3 complete. The server speaks RESP: it decodes commands,
-dispatches them through a registry, and encodes the replies. `PING` and `ECHO`
-work, verified against the real `redis-cli`. No data store, no persistence,
-and no commands beyond those two.
+Milestones 1–4 complete. The server is a working string store: `SET`, `GET`,
+`DEL` and `EXISTS` operate on a keyspace shared by every connection, verified
+against the real `redis-cli`. Values are binary-safe and the store is safe for
+concurrent access. No expiration, no persistence, and no commands beyond
+those plus `PING`, `ECHO`, `CLIENT` and `COMMAND`.
 
 ## Why
 
@@ -49,14 +50,18 @@ The server speaks RESP, so the real client is the right way to try it:
 ```bash
 redis-cli PING                       # PONG
 redis-cli ECHO "hello verdigris"     # "hello verdigris"
-redis-cli PING "custom message"      # "custom message"
+redis-cli SET foo bar                # OK
+redis-cli GET foo                    # "bar"
+redis-cli EXISTS foo                 # (integer) 1
+redis-cli DEL foo                    # (integer) 1
+redis-cli GET foo                    # (nil)
 redis-cli NOTACOMMAND                # (error) ERR unknown command 'NOTACOMMAND'
-redis-cli ECHO                       # (error) ERR wrong number of arguments for 'echo' command
 ```
 
-Command names are case-insensitive, as they are in Redis. Any RESP client
-works, not just `redis-cli`; on Windows without one, PowerShell's `TcpClient`
-can send the raw bytes:
+The keyspace is shared by every connection, so a value set by one client is
+visible to the next. Command names are case-insensitive, as they are in Redis.
+Any RESP client works, not just `redis-cli`; on Windows without one,
+PowerShell's `TcpClient` can send the raw bytes:
 
 ```powershell
 $c = New-Object System.Net.Sockets.TcpClient('127.0.0.1', 6379)

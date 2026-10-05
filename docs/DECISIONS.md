@@ -3,6 +3,45 @@
 Every non-obvious choice gets an entry. Format: date · decision · context ·
 alternatives · reason.
 
+## 2026-10-05 — Handler signature returns (Value, error)
+
+Context: The milestone 3 `Handler` type returned only a `protocol.Value`.
+Domain errors (wrong arity, unknown command) are protocol values and are
+correct in that position, but an internal fault — a bug in a handler — had
+nowhere to go except into a RESP error frame, where the client would see it
+verbatim. That conflates "the client did something wrong" with "we have a
+bug", and it leaks implementation detail to the client.
+
+Decision: change `Handler` and `Registry.Dispatch` to return
+`(protocol.Value, error)`. The Value is the reply, always sent to the
+client. The error, when non-nil, is an internal fault the loop logs and
+converts to a generic `ERR internal error` reply. Handlers return
+`protocol.Error(...)` for domain errors and `(nil, err)` for internal
+faults.
+
+Cost: PING and ECHO change signature trivially (they return `(reply, nil)`).
+Existing tests need one added return value. Not worth deferring.
+
+## 2026-10-05 — Argument byte lifetime: store copies on entry and exit
+
+Context: Handlers receive `BulkString` arguments that alias the connection's
+read buffer. The read loop writes the reply before the next read, so in
+milestone 3 the aliasing was safe. That safety is a property of the loop,
+not of the handler contract — a refactor that reads ahead would silently
+corrupt every handler that holds onto argument bytes.
+
+Decision: the store copies on entry and on exit. `Store.Set` copies both
+key and value; `Store.Get` returns a fresh copy. Handlers may pass aliased
+argument bytes directly to the store without copying; handlers may retain
+what `Store.Get` returns without worrying about lifetimes. The read loop
+stays as-is — its ordering becomes a performance property, not a correctness
+one.
+
+Cost: one allocation per argument on write, one per value on read. For a
+store that is not yet measured, correctness wins. If milestone 8's benchmarks
+show the copies are the bottleneck, revisit with an explicitly unsafe read
+path and a documented contract change.
+
 ## 2026-10-05 — Strict CRLF only; no bare-LF leniency
 
 Context: Real Redis accepts a bare LF on length lines when reading commands,

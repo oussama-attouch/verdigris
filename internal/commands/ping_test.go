@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/Oussama-Att/verdigris/internal/protocol"
+	"github.com/Oussama-Att/verdigris/internal/store"
 )
 
 // arg builds a command argument list from strings, the way Dispatch receives
@@ -70,7 +71,10 @@ func TestPing(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Ping(tt.args)
+			got, fault := Ping(tt.args)
+			if fault != nil {
+				t.Fatalf("Ping(%#v) reported an internal fault: %v", tt.args, fault)
+			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("Ping(%#v) = %#v, want %#v", tt.args, got, tt.want)
 			}
@@ -85,7 +89,10 @@ func TestPing(t *testing.T) {
 func TestPingMessageIsBinarySafe(t *testing.T) {
 	payload := []byte{0x00, 0xff, '\r', '\n', 0xfe, 0x00, '\r', 0xff, '\n'}
 
-	got := Ping([]protocol.Value{protocol.BulkString([]byte("PING")), protocol.BulkString(payload)})
+	got, fault := Ping([]protocol.Value{protocol.BulkString([]byte("PING")), protocol.BulkString(payload)})
+	if fault != nil {
+		t.Fatalf("Ping reported an internal fault: %v", fault)
+	}
 
 	bs, ok := got.(protocol.BulkString)
 	if !ok {
@@ -103,7 +110,10 @@ func TestPingDoesNotMutateTheArgument(t *testing.T) {
 	original := []byte("hello")
 	arg := protocol.BulkString(original)
 
-	got := Ping([]protocol.Value{protocol.BulkString([]byte("PING")), arg})
+	got, fault := Ping([]protocol.Value{protocol.BulkString([]byte("PING")), arg})
+	if fault != nil {
+		t.Fatalf("Ping reported an internal fault: %v", fault)
+	}
 
 	bs, ok := got.(protocol.BulkString)
 	if !ok {
@@ -120,7 +130,10 @@ func TestPingDoesNotMutateTheArgument(t *testing.T) {
 // TestPingWithNoArgumentsAtAll covers Dispatch's empty-array guard being
 // bypassed by a direct call: len(args) == 0 lands in the default branch.
 func TestPingWithNoArgumentsAtAll(t *testing.T) {
-	got := Ping(nil)
+	got, fault := Ping(nil)
+	if fault != nil {
+		t.Fatalf("Ping(nil) reported an internal fault: %v", fault)
+	}
 	if got != protocol.Error("ERR wrong number of arguments for 'ping' command") {
 		t.Fatalf("Ping(nil) = %#v, want a wrong-arity error", got)
 	}
@@ -172,7 +185,10 @@ func TestEcho(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Echo(tt.args)
+			got, fault := Echo(tt.args)
+			if fault != nil {
+				t.Fatalf("Echo(%#v) reported an internal fault: %v", tt.args, fault)
+			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("Echo(%#v) = %#v, want %#v", tt.args, got, tt.want)
 			}
@@ -193,7 +209,10 @@ func TestEchoIsBinarySafe(t *testing.T) {
 	}
 
 	for _, payload := range payloads {
-		got := Echo([]protocol.Value{protocol.BulkString([]byte("ECHO")), protocol.BulkString(payload)})
+		got, fault := Echo([]protocol.Value{protocol.BulkString([]byte("ECHO")), protocol.BulkString(payload)})
+		if fault != nil {
+			t.Fatalf("Echo reported an internal fault for payload % x: %v", payload, fault)
+		}
 
 		bs, ok := got.(protocol.BulkString)
 		if !ok {
@@ -209,7 +228,10 @@ func TestEchoIsBinarySafe(t *testing.T) {
 // integration test suites match on this string, and the milestone's
 // redis-cli demo asserts it verbatim.
 func TestWrongArityMessageMatchesRedisFormat(t *testing.T) {
-	got := Echo(args("ECHO"))
+	got, fault := Echo(args("ECHO"))
+	if fault != nil {
+		t.Fatalf("Echo with no message reported an internal fault: %v", fault)
+	}
 
 	errValue, ok := got.(protocol.Error)
 	if !ok {
@@ -266,7 +288,10 @@ func TestHandlersWorkOnDecodedFrames(t *testing.T) {
 				t.Fatalf("Decode consumed %d of %d bytes", n, len(tt.wire))
 			}
 
-			got := DefaultRegistry().Dispatch(decoded)
+			got, fault := DefaultRegistry(store.New()).Dispatch(decoded)
+			if fault != nil {
+				t.Fatalf("Dispatch reported an internal fault: %v", fault)
+			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("Dispatch = %#v, want %#v", got, tt.want)
 			}
@@ -281,7 +306,10 @@ func TestHandlersWorkOnDecodedFrames(t *testing.T) {
 // TestPingIntegerArgumentIsRejected keeps the type check honest for a value
 // a client could plausibly send by mistake.
 func TestPingIntegerArgumentIsRejected(t *testing.T) {
-	got := Ping([]protocol.Value{protocol.BulkString([]byte("PING")), protocol.Integer(9223372036854775807)})
+	got, fault := Ping([]protocol.Value{protocol.BulkString([]byte("PING")), protocol.Integer(9223372036854775807)})
+	if fault != nil {
+		t.Fatalf("Ping reported an internal fault: %v", fault)
+	}
 
 	if _, ok := got.(protocol.Error); !ok {
 		t.Fatalf("Ping with an integer argument returned %#v, want an error", got)

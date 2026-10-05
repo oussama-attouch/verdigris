@@ -14,6 +14,7 @@ import (
 
 	"github.com/Oussama-Att/verdigris/internal/commands"
 	"github.com/Oussama-Att/verdigris/internal/protocol"
+	"github.com/Oussama-Att/verdigris/internal/store"
 )
 
 // DefaultPort is the TCP port Verdigris listens on by default. 6379 is
@@ -62,6 +63,12 @@ type Server struct {
 	// addr is the address passed to New, kept so Listen can report it and so
 	// the binding decision is made in exactly one place.
 	addr string
+
+	// store is the keyspace every connection on this server shares. It is a
+	// field here rather than of a connection because the keyspace outlives
+	// any one client; the handlers capture it, and the registry is built from
+	// the same pointer.
+	store *store.Store
 
 	// registry routes decoded commands to handlers. It is set by New and read
 	// by every connection goroutine; a Registry is safe for concurrent use,
@@ -123,11 +130,19 @@ type Server struct {
 // port, which is what tests use so they never collide with a real server.
 //
 // The returned Server answers the built-in commands (see
-// commands.DefaultRegistry).
+// commands.DefaultRegistry) against a store it creates here. The store is a
+// field of the Server, not of a connection, which is what makes two clients
+// see each other's writes — the property the keyspace is for.
 func New(addr string) *Server {
+	// One store, shared by every connection this server accepts. Constructing
+	// it once and handing the same pointer to the registry is the whole
+	// mechanism by which two clients see each other's writes.
+	s := store.New()
+
 	return &Server{
 		addr:     addr,
-		registry: commands.DefaultRegistry(),
+		store:    s,
+		registry: commands.DefaultRegistry(s),
 		done:     make(chan struct{}),
 	}
 }
@@ -349,7 +364,17 @@ func readCommands(remote string, reader *bufio.Reader, writer *bufio.Writer, reg
 			// what makes it safe for a handler to return a bulk string that
 			// aliases buf: nothing overwrites those bytes until the reply has
 			// left the process.
-			if writeErr := writeReply(writer, registry.Dispatch(value)); writeErr != nil {
+			reply, fault := registry.Dispatch(value)
+			if fault != nil {
+				// An internal fault is a bug on our side, not something the
+				// client did. The detail goes to the log where an operator can
+				// act on it; the client gets a generic error, because the
+				// fault text would leak implementation detail it cannot use
+				// and must not depend on.
+				log.Printf("internal fault from %s: %v", remote, fault)
+				reply = protocol.Error("ERR internal error")
+			}
+			if writeErr := writeReply(writer, reply); writeErr != nil {
 				log.Printf("write to %s: %v", remote, writeErr)
 				return
 			}

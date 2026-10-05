@@ -1,11 +1,13 @@
 package commands
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/Oussama-Att/verdigris/internal/protocol"
+	"github.com/Oussama-Att/verdigris/internal/store"
 )
 
 // mustError asserts a reply is a RESP Error frame and returns its message.
@@ -32,12 +34,15 @@ func TestRegisterAndDispatch(t *testing.T) {
 	r := NewRegistry()
 
 	called := 0
-	r.Register("HELLO", func(a []protocol.Value) protocol.Value {
+	r.Register("HELLO", func(a []protocol.Value) (protocol.Value, error) {
 		called++
-		return protocol.SimpleString("HI")
+		return protocol.SimpleString("HI"), nil
 	})
 
-	got := r.Dispatch(protocol.Array{protocol.BulkString([]byte("HELLO"))})
+	got, fault := r.Dispatch(protocol.Array{protocol.BulkString([]byte("HELLO"))})
+	if fault != nil {
+		t.Fatalf("Dispatch reported an internal fault: %v", fault)
+	}
 	if got != protocol.SimpleString("HI") {
 		t.Fatalf("Dispatch = %#v, want SimpleString(\"HI\")", got)
 	}
@@ -55,7 +60,10 @@ func TestDispatchIsCaseInsensitive(t *testing.T) {
 
 	for _, name := range []string{"ping", "PING", "Ping", "pInG"} {
 		t.Run(name, func(t *testing.T) {
-			got := r.Dispatch(protocol.Array{protocol.BulkString([]byte(name))})
+			got, fault := r.Dispatch(protocol.Array{protocol.BulkString([]byte(name))})
+			if fault != nil {
+				t.Fatalf("Dispatch reported an internal fault: %v", fault)
+			}
 			if got != protocol.SimpleString("PONG") {
 				t.Fatalf("Dispatch(%q) = %#v, want SimpleString(\"PONG\")", name, got)
 			}
@@ -64,9 +72,12 @@ func TestDispatchIsCaseInsensitive(t *testing.T) {
 }
 
 func TestDispatchUnknownCommand(t *testing.T) {
-	r := DefaultRegistry()
+	r := DefaultRegistry(store.New())
 
-	got := r.Dispatch(protocol.Array{protocol.BulkString([]byte("NOTACOMMAND"))})
+	got, fault := r.Dispatch(protocol.Array{protocol.BulkString([]byte("NOTACOMMAND"))})
+	if fault != nil {
+		t.Fatalf("Dispatch reported an internal fault: %v", fault)
+	}
 
 	msg := mustError(t, got)
 	if !strings.Contains(msg, "NOTACOMMAND") {
@@ -81,9 +92,12 @@ func TestDispatchUnknownCommand(t *testing.T) {
 // redis-cli demo asserts. A client sending lower case must still see the name
 // upper-cased, because that is what Redis echoes back.
 func TestDispatchUnknownCommandIsUppercased(t *testing.T) {
-	r := DefaultRegistry()
+	r := DefaultRegistry(store.New())
 
-	got := r.Dispatch(protocol.Array{protocol.BulkString([]byte("notacommand"))})
+	got, fault := r.Dispatch(protocol.Array{protocol.BulkString([]byte("notacommand"))})
+	if fault != nil {
+		t.Fatalf("Dispatch reported an internal fault: %v", fault)
+	}
 
 	const want = "ERR unknown command 'NOTACOMMAND'"
 	if msg := mustError(t, got); msg != want {
@@ -92,7 +106,7 @@ func TestDispatchUnknownCommandIsUppercased(t *testing.T) {
 }
 
 func TestDispatchRejectsNonArray(t *testing.T) {
-	r := DefaultRegistry()
+	r := DefaultRegistry(store.New())
 
 	// A bare bulk string, a simple string, an integer, a null, and nil are
 	// all things a client could put on the wire that are not commands.
@@ -106,7 +120,14 @@ func TestDispatchRejectsNonArray(t *testing.T) {
 
 	for _, in := range inputs {
 		t.Run(commandsTypeName(in), func(t *testing.T) {
-			got := r.Dispatch(in)
+			got, fault := r.Dispatch(in)
+			if fault != nil {
+				// A malformed request is the client's problem, not an
+				// internal fault. Reporting one here would mean the read loop
+				// logged a bug that does not exist and answered with a
+				// generic error instead of the specific one.
+				t.Fatalf("Dispatch reported an internal fault for a client error: %v", fault)
+			}
 
 			if msg := mustError(t, got); msg != "ERR unknown command" {
 				t.Fatalf("Dispatch(%#v) = %q, want \"ERR unknown command\"", in, msg)
@@ -116,9 +137,12 @@ func TestDispatchRejectsNonArray(t *testing.T) {
 }
 
 func TestDispatchRejectsEmptyArray(t *testing.T) {
-	r := DefaultRegistry()
+	r := DefaultRegistry(store.New())
 
-	got := r.Dispatch(protocol.Array{})
+	got, fault := r.Dispatch(protocol.Array{})
+	if fault != nil {
+		t.Fatalf("Dispatch reported an internal fault: %v", fault)
+	}
 
 	if msg := mustError(t, got); msg != "ERR empty command" {
 		t.Fatalf("Dispatch(empty array) = %q, want \"ERR empty command\"", msg)
@@ -126,7 +150,7 @@ func TestDispatchRejectsEmptyArray(t *testing.T) {
 }
 
 func TestDispatchRejectsNonBulkCommandName(t *testing.T) {
-	r := DefaultRegistry()
+	r := DefaultRegistry(store.New())
 
 	// Real clients always send the command name as a bulk string. An integer,
 	// a simple string, a nested array, or a null in that position is a
@@ -141,7 +165,10 @@ func TestDispatchRejectsNonBulkCommandName(t *testing.T) {
 
 	for _, name := range inputs {
 		t.Run(commandsTypeName(name), func(t *testing.T) {
-			got := r.Dispatch(protocol.Array{name})
+			got, fault := r.Dispatch(protocol.Array{name})
+			if fault != nil {
+				t.Fatalf("Dispatch reported an internal fault for a client error: %v", fault)
+			}
 
 			if msg := mustError(t, got); msg != "ERR invalid command name" {
 				t.Fatalf("Dispatch([%#v]) = %q, want \"ERR invalid command name\"", name, msg)
@@ -157,9 +184,9 @@ func TestDispatchPassesFullArgumentList(t *testing.T) {
 	r := NewRegistry()
 
 	var seen []protocol.Value
-	r.Register("CAPTURE", func(a []protocol.Value) protocol.Value {
+	r.Register("CAPTURE", func(a []protocol.Value) (protocol.Value, error) {
 		seen = a
-		return protocol.SimpleString("OK")
+		return protocol.SimpleString("OK"), nil
 	})
 
 	in := protocol.Array{
@@ -168,7 +195,9 @@ func TestDispatchPassesFullArgumentList(t *testing.T) {
 		protocol.Integer(2),
 		protocol.Null{},
 	}
-	r.Dispatch(in)
+	if _, fault := r.Dispatch(in); fault != nil {
+		t.Fatalf("Dispatch reported an internal fault: %v", fault)
+	}
 
 	if !reflect.DeepEqual(seen, []protocol.Value(in)) {
 		t.Fatalf("handler saw %#v, want %#v", seen, in)
@@ -179,19 +208,74 @@ func TestDispatchDoesNotAlterTheReply(t *testing.T) {
 	r := NewRegistry()
 
 	// A Null reply must come back as Null: a registry that coerced empty
-	// replies into errors would break every future command that returns one.
-	r.Register("NULLY", func([]protocol.Value) protocol.Value { return protocol.Null{} })
+	// replies into errors would break every command that returns one.
+	r.Register("NULLY", func([]protocol.Value) (protocol.Value, error) { return protocol.Null{}, nil })
 
-	if got := r.Dispatch(protocol.Array{protocol.BulkString([]byte("NULLY"))}); got != (protocol.Null{}) {
+	got, fault := r.Dispatch(protocol.Array{protocol.BulkString([]byte("NULLY"))})
+	if fault != nil {
+		t.Fatalf("Dispatch reported an internal fault: %v", fault)
+	}
+	if got != (protocol.Null{}) {
 		t.Fatalf("Dispatch = %#v, want Null{}", got)
 	}
 }
 
+// TestDispatchPropagatesInternalFault is the test for the whole point of the
+// (Value, error) signature: a handler bug must reach the caller as an error,
+// separately from the reply, so the read loop can log it and substitute a
+// generic message instead of forwarding the fault text to the client.
+func TestDispatchPropagatesInternalFault(t *testing.T) {
+	r := NewRegistry()
+
+	sentinel := errors.New("something went wrong inside the handler")
+	r.Register("BROKEN", func([]protocol.Value) (protocol.Value, error) {
+		// A real handler bug: no reply, and an error describing it.
+		return nil, sentinel
+	})
+
+	reply, fault := r.Dispatch(protocol.Array{protocol.BulkString([]byte("BROKEN"))})
+
+	if !errors.Is(fault, sentinel) {
+		t.Fatalf("Dispatch fault = %v, want the handler's error", fault)
+	}
+	if reply != nil {
+		t.Fatalf("Dispatch reply = %#v alongside a fault, want nil", reply)
+	}
+
+	// The fault text must not be reachable through the reply, which is what
+	// the client would receive if the loop forwarded it.
+	if encoded := protocol.Encode(reply); len(encoded) != 0 {
+		t.Fatalf("a faulted dispatch produced reply bytes %q, want none", encoded)
+	}
+}
+
+// TestDispatchDomainErrorsAreNotFaults is the other half of that contract, and
+// the one that is easy to get backwards: a handler returning a protocol.Error
+// is answering the client correctly, and must not be reported as a bug.
+func TestDispatchDomainErrorsAreNotFaults(t *testing.T) {
+	r := DefaultRegistry(store.New())
+
+	for _, in := range []protocol.Value{
+		protocol.Array{protocol.BulkString([]byte("PING")), protocol.BulkString([]byte("a")), protocol.BulkString([]byte("b"))},
+		protocol.Array{protocol.BulkString([]byte("ECHO"))},
+		protocol.Array{protocol.BulkString([]byte("GET"))},
+		protocol.Array{protocol.BulkString([]byte("NOTACOMMAND"))},
+	} {
+		reply, fault := r.Dispatch(in)
+		if fault != nil {
+			t.Fatalf("Dispatch(%#v) reported an internal fault for a domain error: %v", in, fault)
+		}
+		if _, ok := reply.(protocol.Error); !ok {
+			t.Fatalf("Dispatch(%#v) = %#v, want a protocol.Error", in, reply)
+		}
+	}
+}
+
 func TestNames(t *testing.T) {
-	r := DefaultRegistry()
+	r := DefaultRegistry(store.New())
 
 	got := r.Names()
-	want := []string{"ECHO", "PING"}
+	want := []string{"CLIENT", "COMMAND", "DEL", "ECHO", "EXISTS", "GET", "PING", "SET"}
 
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Names() = %v, want %v", got, want)
@@ -247,19 +331,30 @@ func TestRegisterDuplicatePanics(t *testing.T) {
 // TestDefaultRegistryHasTheBuiltins checks the registry the server actually
 // uses, so a missing Register call fails here rather than over the wire.
 func TestDefaultRegistryHasTheBuiltins(t *testing.T) {
-	r := DefaultRegistry()
+	r := DefaultRegistry(store.New())
 
-	for _, name := range []string{"PING", "ECHO"} {
-		got := r.Dispatch(protocol.Array{protocol.BulkString([]byte(name)), protocol.BulkString([]byte("x"))})
-		if _, isErr := got.(protocol.Error); isErr && name == "PING" {
-			// PING with an argument is valid; only a wrong-arity reply would
-			// be an error, and this input has the right arity.
-			t.Fatalf("PING is not registered: %#v", got)
+	for _, name := range []string{"PING", "ECHO", "SET", "GET", "DEL", "EXISTS", "CLIENT", "COMMAND"} {
+		got, fault := r.Dispatch(protocol.Array{
+			protocol.BulkString([]byte(name)),
+			protocol.BulkString([]byte("a")),
+			protocol.BulkString([]byte("b")),
+		})
+		if fault != nil {
+			t.Fatalf("%s reported an internal fault: %v", name, fault)
+		}
+
+		if errValue, isErr := got.(protocol.Error); isErr {
+			// A registered command named the command in its reply; an
+			// unregistered one produces exactly the unknown-command error.
+			if strings.Contains(string(errValue), "unknown command") {
+				t.Fatalf("%s is not registered: %#v", name, got)
+			}
 		}
 	}
 
-	if names := r.Names(); !reflect.DeepEqual(names, []string{"ECHO", "PING"}) {
-		t.Fatalf("DefaultRegistry names = %v, want [ECHO PING]", names)
+	want := []string{"CLIENT", "COMMAND", "DEL", "ECHO", "EXISTS", "GET", "PING", "SET"}
+	if names := r.Names(); !reflect.DeepEqual(names, want) {
+		t.Fatalf("DefaultRegistry names = %v, want %v", names, want)
 	}
 }
 
@@ -267,7 +362,7 @@ func TestDefaultRegistryHasTheBuiltins(t *testing.T) {
 // from one goroutine per connection. Under -race this fails loudly if the map
 // is read without the lock.
 func TestDispatchIsSafeForConcurrentUse(t *testing.T) {
-	r := DefaultRegistry()
+	r := DefaultRegistry(store.New())
 
 	const goroutines = 8
 	const iterations = 200
@@ -277,9 +372,28 @@ func TestDispatchIsSafeForConcurrentUse(t *testing.T) {
 		go func() {
 			defer func() { done <- struct{}{} }()
 			for j := 0; j < iterations; j++ {
-				r.Dispatch(protocol.Array{protocol.BulkString([]byte("PING"))})
-				r.Dispatch(protocol.Array{protocol.BulkString([]byte("ECHO")), protocol.BulkString([]byte("x"))})
-				r.Dispatch(protocol.Array{protocol.BulkString([]byte("NOPE"))})
+				// Concurrent reads of the registry map...
+				_, _ = r.Dispatch(protocol.Array{protocol.BulkString([]byte("PING"))})
+				_, _ = r.Dispatch(protocol.Array{protocol.BulkString([]byte("ECHO")), protocol.BulkString([]byte("x"))})
+				_, _ = r.Dispatch(protocol.Array{protocol.BulkString([]byte("NOPE"))})
+
+				// ...and concurrent writes and reads of the store those
+				// handlers share, which is the new surface this milestone
+				// adds to the same goroutine fan-out.
+				_, _ = r.Dispatch(protocol.Array{
+					protocol.BulkString([]byte("SET")),
+					protocol.BulkString([]byte("shared")),
+					protocol.BulkString([]byte("value")),
+				})
+				_, _ = r.Dispatch(protocol.Array{
+					protocol.BulkString([]byte("GET")),
+					protocol.BulkString([]byte("shared")),
+				})
+				_, _ = r.Dispatch(protocol.Array{
+					protocol.BulkString([]byte("EXISTS")),
+					protocol.BulkString([]byte("shared")),
+				})
+
 				_ = r.Names()
 			}
 		}()
