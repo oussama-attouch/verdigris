@@ -10,20 +10,16 @@ import (
 
 // newTestStore returns a store driven by a fake clock, with the sweeper's
 // tick set short enough that active deletion is observable in milliseconds,
-// and with both the interval and the goroutine cleaned up when the test ends.
+// and with the goroutine cleaned up when the test ends.
 //
-// The interval is restored with t.Cleanup rather than left altered: it is
-// package-level state, so a test that forgot would silently change the
-// behaviour of every test that ran after it in the same binary.
+// The interval is passed to the constructor rather than assigned to a package
+// variable, so there is nothing to restore and no way for this helper to
+// change the behaviour of a test that runs after it.
 func newTestStore(t *testing.T) (*Store, *FakeClock) {
 	t.Helper()
 
-	previous := sweepInterval
-	SetSweepInterval(2 * time.Millisecond)
-	t.Cleanup(func() { sweepInterval = previous })
-
 	clk := NewFakeClock()
-	s := New(clk)
+	s := NewWithInterval(clk, 2*time.Millisecond)
 	t.Cleanup(s.Close)
 
 	return s, clk
@@ -38,7 +34,7 @@ func newTestStore(t *testing.T) (*Store, *FakeClock) {
 // behaviour. Tests about sweeping itself use newTestStore, which shortens the
 // interval instead.
 func newSweeperlessStore(clk Clock) *Store {
-	return newSweeperlessStoreWithClock(clk)
+	return NewWithInterval(clk, time.Hour)
 }
 
 // newSweeperlessStorePair is newSweeperlessStore with the clock handed back
@@ -51,24 +47,6 @@ func newSweeperlessStorePair(t *testing.T) (*Store, *FakeClock) {
 	t.Cleanup(s.Close)
 
 	return s, clk
-}
-
-// newSweeperlessStoreWithClock builds a store whose sweeper will not run for
-// an hour.
-//
-// The long interval is installed, the store is constructed — capturing it —
-// and the package variable is restored immediately. Restoring is safe only
-// because the store copied the interval at construction; a sweeper reading
-// the global per tick would silently pick the restored value back up and this
-// helper would do nothing.
-func newSweeperlessStoreWithClock(clk Clock) *Store {
-	previous := sweepInterval
-	SetSweepInterval(time.Hour)
-
-	s := New(clk)
-
-	SetSweepInterval(previous)
-	return s
 }
 
 // --- TTL basics -------------------------------------------------------------
@@ -587,6 +565,81 @@ func TestSweeperLeavesKeysWithoutExpiryAlone(t *testing.T) {
 
 	if got := s.Len(); got != keys {
 		t.Fatalf("Len = %d after sweeping a keyless-expiry store, want %d", got, keys)
+	}
+}
+
+// TestSweepRoundRepeatRule pins the repeat condition at its boundary.
+//
+// It exists because the condition changed: it was
+// `ratio > threshold || deleted == len(sample)`, and the second clause was
+// provably dead, since a fully dead sample has a ratio of exactly 1.0 and
+// 1.0 > 0.25. Removing a clause from a loop-controlling predicate deserves a
+// test that would fail if the behaviour it guarded were lost, rather than only
+// the confidence that the arithmetic worked out.
+//
+// sweepRound is called directly, so nothing here races the background sweeper
+// or depends on how long a tick took.
+//
+// The store holds at most sweepSampleSize keys in each case, so the sample is
+// every expiring key rather than a random subset. That is what makes the
+// ratio deterministic: with fewer expiring keys than the sample cap, the
+// sample is exact and dead/total is the ratio the method computes.
+func TestSweepRoundRepeatRule(t *testing.T) {
+	tests := []struct {
+		name  string
+		total int // keys with an expiry, at most sweepSampleSize
+		dead  int // how many of them have already expired
+		want  bool
+	}{
+		{"no keys at all", 0, 0, false},
+		{"no expiring keys are dead", 4, 0, false},
+		{"exactly a quarter dead does not repeat", 4, 1, false},
+		{"just over a quarter dead repeats", 4, 2, true},
+		{"half dead repeats", 4, 2, true},
+		{"three quarters dead repeats", 4, 3, true},
+		{"every key dead repeats", 4, 4, true},
+		// The case the removed clause was written for: a sample capped at
+		// sweepSampleSize, entirely dead. The ratio is exactly 1.0 and the
+		// threshold test alone must carry it.
+		{"a full sample, every key dead", sweepSampleSize, sweepSampleSize, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clk := NewFakeClock()
+			s := newSweeperlessStore(clk)
+			t.Cleanup(s.Close)
+
+			// Lay down every key with an expiry, then age the dead ones only.
+			// Two advances are used so the live keys are written after the
+			// first one and keep a full hour from the current fake time.
+			for i := 0; i < tt.dead; i++ {
+				s.SetWithTTL([]byte(fmt.Sprintf("dead-%d", i)), []byte("v"), time.Minute)
+			}
+			clk.Advance(2 * time.Minute)
+			for i := 0; i < tt.total-tt.dead; i++ {
+				s.SetWithTTL([]byte(fmt.Sprintf("live-%d", i)), []byte("v"), time.Hour)
+			}
+
+			// The sample is taken from keys with an expiry in map-iteration
+			// order, which is randomized. When the ratio is unambiguous the
+			// order cannot matter and the outcome is asserted directly; when
+			// a partly dead sample could contain either group, the example is
+			// chosen so the answer holds whatever the order.
+			got := s.sweepRound()
+			if got != tt.want {
+				dead := s.Len() // every key was sampled, so all that remain are live ones
+				t.Fatalf("sweepRound with %d of %d expiring keys dead = %v, want %v (%d keys remain)",
+					tt.dead, tt.total, got, tt.want, dead)
+			}
+
+			// Every expired key must have been removed, whatever the verdict.
+			for i := 0; i < tt.dead; i++ {
+				if s.Exists([]byte(fmt.Sprintf("dead-%d", i))) {
+					t.Fatalf("dead-%d survived the round", i)
+				}
+			}
+		})
 	}
 }
 

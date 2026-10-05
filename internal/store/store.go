@@ -66,15 +66,10 @@ type Store struct {
 	// time.Now directly, which is what makes TTL tests deterministic.
 	clk Clock
 
-	// interval is the sweeper's tick period, captured from the package
-	// variable when the store was constructed.
-	//
-	// It is copied rather than read per tick so that a test can set the
-	// interval, build a store, and restore the variable immediately without
-	// changing the behaviour of the sweeper it just started. Reading the
-	// global on every tick would make the interval mutable from outside at
-	// any moment, which is a data race in waiting and makes "restore what you
-	// changed" impossible to honour.
+	// interval is the sweeper's tick period. It is set once at construction
+	// and never read from anywhere else, so there is no shared mutable state
+	// to race over and no "set it before you build the store" rule to
+	// remember.
 	interval time.Duration
 
 	// stop and stopped coordinate the active expiration sweeper. stop is
@@ -86,8 +81,8 @@ type Store struct {
 	once    sync.Once
 }
 
-// New returns an empty Store whose expiry checks read clk, and starts the
-// background sweeper that performs active deletion.
+// New returns an empty Store whose expiry checks read clk, with the default
+// sweep interval.
 //
 // The sweeper runs until Close is called. A Store that is never closed leaks
 // one goroutine, so a long-lived process that creates stores dynamically must
@@ -95,6 +90,24 @@ type Store struct {
 // semantics may rely on process exit, but every test in this package that
 // asserts anything about sweeping calls Close explicitly.
 func New(clk Clock) *Store {
+	return NewWithInterval(clk, DefaultSweepInterval)
+}
+
+// NewWithInterval is New with an explicit sweeper interval, which is what a
+// caller honouring a configuration flag wants and what a test that needs to
+// observe active expiration quickly wants.
+//
+// A non-positive interval selects the default rather than being passed to
+// time.NewTicker, which panics on one.
+//
+// The interval is a parameter rather than a package-level variable by
+// deliberate design. A mutable global read by a background goroutine is a data
+// race waiting for someone to set it at the wrong moment, and it forces an
+// ordering rule on every caller — set the variable, then construct — that
+// nothing enforces. Passing it in makes the configuration visible at the
+// construction site and makes "which interval is this store using" answerable
+// by reading one line.
+func NewWithInterval(clk Clock, interval time.Duration) *Store {
 	if clk == nil {
 		// A nil Clock would panic on the first TTL query, deep inside a
 		// handler, with a stack trace that says nothing about the caller's
@@ -103,11 +116,14 @@ func New(clk Clock) *Store {
 		// passes explicitly.
 		clk = RealClock{}
 	}
+	if interval <= 0 {
+		interval = DefaultSweepInterval
+	}
 
 	s := &Store{
 		data:     make(map[string]entry),
 		clk:      clk,
-		interval: sweepInterval,
+		interval: interval,
 		stop:     make(chan struct{}),
 		stopped:  make(chan struct{}),
 	}

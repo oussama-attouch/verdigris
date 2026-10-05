@@ -144,16 +144,16 @@ func New(addr string, clk store.Clock, sweepInterval time.Duration) *Server {
 	if clk == nil {
 		clk = store.RealClock{}
 	}
-	if sweepInterval <= 0 {
-		sweepInterval = store.DefaultSweepInterval
-	}
-	store.SetSweepInterval(sweepInterval)
 
 	// Constructing the store once and handing the same pointer to the
 	// registry is the whole mechanism by which two clients see each other's
 	// writes. The server also keeps the pointer, so Shutdown can stop the
 	// sweeper goroutine the store started.
-	kv := store.New(clk)
+	//
+	// The interval goes in as an argument rather than through a package-level
+	// setter, so this store's tick period is stated on the line that builds
+	// it. A non-positive value is normalised inside the store.
+	kv := store.NewWithInterval(clk, sweepInterval)
 
 	return &Server{
 		addr:     addr,

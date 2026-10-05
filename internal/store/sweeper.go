@@ -20,52 +20,26 @@ const (
 // nothing overrides it.
 const DefaultSweepInterval = 100 * time.Millisecond
 
-// sweepInterval is how long the active expiration sweeper waits between
-// rounds.
-//
-// This is a var rather than a const on purpose: tests override it to make
-// active expiration observable without sleeping for a realistic interval.
-//
-// Because it is package-level mutable state, the rules for changing it after
-// a sweeper has started are load-bearing:
-//
-//   - Set it before constructing a Store, or through SetSweepInterval, which
-//     is documented for the same reason.
-//   - Never mutate it while a sweeper goroutine is running: the sweeper reads
-//     it from its own goroutine, so an unsynchronised write is a data race
-//     that -race will report, not merely a surprise.
-//
-// The tests in this package change it once at the top of a test and restore
-// it with t.Cleanup, which keeps the mutation outside any sweeper's lifetime
-// in practice.
-var sweepInterval = DefaultSweepInterval
-
-// SetSweepInterval sets how often newly started sweepers run. A non-positive
-// value restores the default.
-//
-// It exists so that a caller outside this package — cmd/verdigris, honouring
-// a flag — can configure the interval without reaching into a package
-// variable. Like the variable it writes, it is intended to be called during
-// setup: changing the interval while sweepers are running races with their
-// reads of it.
-func SetSweepInterval(d time.Duration) {
-	if d <= 0 {
-		d = DefaultSweepInterval
-	}
-	sweepInterval = d
-}
-
 // sweep is the active deletion loop. It runs until stop is closed, then
 // closes stopped so that Close can block on the goroutine actually finishing
 // rather than assuming it has.
+//
+// A single ticker is created for the life of the loop rather than calling
+// time.After on each pass. Both are interruptible — the select below returns
+// from a pending time.After the moment stop closes — so this is not a shutdown
+// latency fix. It is an allocation fix: time.After builds a new timer every
+// time it is reached, and this loop reaches it forever.
 func (s *Store) sweep() {
 	defer close(s.stopped)
+
+	ticker := time.NewTicker(s.interval)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-s.stop:
 			return
-		case <-time.After(s.interval):
+		case <-ticker.C:
 		}
 
 		// One round may be followed immediately by another when the sample
@@ -138,13 +112,16 @@ func (s *Store) sweepRound() bool {
 	// Repeat when the sample was mostly expired, which is the signal that
 	// there is a backlog worth working through now.
 	//
-	// The `deleted == len(sample)` clause catches the case the ratio alone
-	// cannot: when every sampled key was dead, the sample was capped at
-	// sweepSampleSize and may have been the first twenty of thousands, so
-	// stopping here would drain the keyspace at twenty keys per tick no
-	// matter how urgently it needed draining.
+	// One clause, not two. A fully dead sample has a ratio of exactly 1.0,
+	// which already exceeds the threshold, so an additional
+	// `|| deleted == len(sample)` would never change the outcome — it would
+	// only suggest, falsely, that the ratio test has a gap at the extreme
+	// the way it does at the low end. The useful boundary is the other one:
+	// an empty sample returns early above, because 0/0 is not a number and
+	// because a full scan of a keyspace with nothing to collect should not
+	// repeat.
 	ratio := float64(deleted) / float64(len(sample))
-	return ratio > sweepRepeatThreshold || deleted == len(sample)
+	return ratio > sweepRepeatThreshold
 }
 
 // deleteIfExpired removes k if it is still expired, returning whether it
