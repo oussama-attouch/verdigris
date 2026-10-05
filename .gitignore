@@ -1,0 +1,29 @@
+# Build output
+/bin/
+*.exe
+*.out
+*.test
+
+# Test coverage
+*.cover
+coverage.out
+coverage.html
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data (RDB / AOF files written by the server during testing)
+*.rdb
+*.aof
+data/
+
+# Go workspace files
+go.work
+go.work.sum
