@@ -4,11 +4,12 @@ A Redis-compatible key-value store, written from scratch in Go.
 
 ## Status
 
-Milestones 1–4 complete. The server is a working string store: `SET`, `GET`,
-`DEL` and `EXISTS` operate on a keyspace shared by every connection, verified
-against the real `redis-cli`. Values are binary-safe and the store is safe for
-concurrent access. No expiration, no persistence, and no commands beyond
-those plus `PING`, `ECHO`, `CLIENT` and `COMMAND`.
+Milestones 1–5 complete. The server is a working string store with key
+expiration: `SET`, `GET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL` and `PERSIST`
+operate on a keyspace shared by every connection, with `SET ... EX/PX` for
+time-limited writes. Expired keys are removed both on access and by a
+background sweeper, and every TTL test runs on an injected clock rather than
+sleeping. No persistence yet.
 
 ## Why
 
@@ -55,6 +56,8 @@ redis-cli GET foo                    # "bar"
 redis-cli EXISTS foo                 # (integer) 1
 redis-cli DEL foo                    # (integer) 1
 redis-cli GET foo                    # (nil)
+redis-cli SET session abc EX 5       # expires in five seconds
+redis-cli TTL session                # (integer) 5, then counts down
 redis-cli NOTACOMMAND                # (error) ERR unknown command 'NOTACOMMAND'
 ```
 

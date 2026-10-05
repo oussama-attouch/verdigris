@@ -128,6 +128,9 @@ func DefaultRegistry(s *store.Store) *Registry {
 	r.Register("GET", GetHandler(s))
 	r.Register("DEL", DelHandler(s))
 	r.Register("EXISTS", ExistsHandler(s))
+	r.Register("EXPIRE", ExpireHandler(s))
+	r.Register("TTL", TTLHandler(s))
+	r.Register("PERSIST", PersistHandler(s))
 	r.Register("CLIENT", ClientHandler())
 	r.Register("COMMAND", CommandHandler())
 	return r

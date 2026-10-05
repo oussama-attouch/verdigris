@@ -64,14 +64,15 @@ type Server struct {
 	// the binding decision is made in exactly one place.
 	addr string
 
+	// store is the keyspace every connection on this server shares, held so
+	// that Shutdown can stop its expiration sweeper. The handlers also hold
+	// it, handed over through the registry; this reference exists for
+	// lifecycle, not for data access.
+	store *store.Store
+
 	// registry routes decoded commands to handlers. It is set by New and read
 	// by every connection goroutine; a Registry is safe for concurrent use,
 	// which is what makes that sharing safe.
-	//
-	// The keyspace is not a field here. New constructs one store and hands it
-	// to DefaultRegistry, whose handlers close over it, so the registry owns
-	// the only reference the server needs. Keeping a second reference would
-	// be an unread field.
 	//
 	// Tests in this package may replace it with a registry holding their own
 	// handlers.
@@ -128,22 +129,48 @@ type Server struct {
 // addr is in net.Listen's "host:port" form. ":0" asks the kernel for a free
 // port, which is what tests use so they never collide with a real server.
 //
+// clk is the store's clock. Production passes store.RealClock{}; a test that
+// wants to control expiry without sleeping passes its own.
+//
+// sweepInterval is how often the store's active expiration sweeper runs. A
+// non-positive value uses the store's default.
+//
 // The returned Server answers the built-in commands (see
 // commands.DefaultRegistry) against a store created here. One store is
 // created and handed to the registry, whose handlers close over it, so every
 // connection this server accepts shares one keyspace — the property that
 // makes two clients see each other's writes.
-func New(addr string) *Server {
+func New(addr string, clk store.Clock, sweepInterval time.Duration) *Server {
+	if clk == nil {
+		clk = store.RealClock{}
+	}
+	if sweepInterval <= 0 {
+		sweepInterval = store.DefaultSweepInterval
+	}
+	store.SetSweepInterval(sweepInterval)
+
 	// Constructing the store once and handing the same pointer to the
 	// registry is the whole mechanism by which two clients see each other's
-	// writes. The server itself never needs to reference it again: no
-	// connection handling touches the keyspace directly, only through a
-	// dispatched command.
+	// writes. The server also keeps the pointer, so Shutdown can stop the
+	// sweeper goroutine the store started.
+	kv := store.New(clk)
+
 	return &Server{
 		addr:     addr,
-		registry: commands.DefaultRegistry(store.New()),
+		store:    kv,
+		registry: commands.DefaultRegistry(kv),
 		done:     make(chan struct{}),
 	}
+}
+
+// Close stops the store's active expiration sweeper. It does not clear the
+// keyspace, and it is safe to call more than once.
+//
+// Shutdown calls this after draining connections. A caller that never started
+// listening — a Server constructed and discarded — must call this directly,
+// or the sweeper goroutine outlives it.
+func (s *Server) Close() {
+	s.store.Close()
 }
 
 // Listen starts the TCP listener and returns once the listener is bound.
@@ -224,7 +251,13 @@ func (s *Server) Serve() error {
 //
 // It is safe to call more than once and safe to call from a goroutine other
 // than the one running Serve.
-func (s *Server) Shutdown(ctx context.Context) error {
+//
+// The store's expiration sweeper is stopped on every path out, including both
+// error paths, which is why the Close is deferred rather than placed at the
+// end: a timeout during draining must not leave a background goroutine behind.
+func (s *Server) Shutdown(ctx context.Context) (err error) {
+	defer s.Close()
+
 	// Close the listener first, so no new connections arrive while we are
 	// draining. Closing it is also what unblocks Accept and ends Serve.
 	s.shutdownOnce.Do(func() {

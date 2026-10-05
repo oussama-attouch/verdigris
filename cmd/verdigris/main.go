@@ -12,12 +12,13 @@ import (
 	"time"
 
 	"github.com/Oussama-Att/verdigris/internal/server"
+	"github.com/Oussama-Att/verdigris/internal/store"
 )
 
 // version is a placeholder. It will be populated from build metadata in a
 // later milestone. For now it exists so the binary has something to print
 // and so the build can be verified end to end.
-const version = "0.3.0-milestone4"
+const version = "0.4.0-milestone5"
 
 // shutdownTimeout bounds how long a graceful shutdown may take before
 // in-flight connections are cut off.
@@ -25,6 +26,8 @@ const shutdownTimeout = 5 * time.Second
 
 func main() {
 	port := flag.Int("port", server.DefaultPort, "TCP port to listen on (1-65535)")
+	sweepInterval := flag.Duration("sweep-interval", store.DefaultSweepInterval,
+		"how often the active expiration sweeper runs (e.g. 100ms, 1s)")
 	flag.Parse()
 
 	// A port outside the range is a usage error, not a runtime failure, so it
@@ -36,13 +39,24 @@ func main() {
 		os.Exit(2)
 	}
 
+	// A non-positive interval is also a usage error. The store would silently
+	// substitute its default, but silently ignoring a flag the operator
+	// explicitly set is worse than telling them it was wrong.
+	if *sweepInterval <= 0 {
+		fmt.Fprintf(os.Stderr, "verdigris: invalid -sweep-interval %s: must be positive\n", *sweepInterval)
+		flag.Usage()
+		os.Exit(2)
+	}
+
 	// Printed before the listener starts, so an operator looking at a running
 	// process can confirm which build it is.
 	fmt.Fprintf(os.Stdout, "verdigris %s\n", version)
 
 	// ":" + a validated integer binds every interface on that port, which is
-	// the same thing redis-server does by default.
-	srv := server.New(":" + strconv.Itoa(*port))
+	// the same thing redis-server does by default. The clock is the real one:
+	// expiry in production follows wall-clock time, and injecting a clock is
+	// for the tests.
+	srv := server.New(":"+strconv.Itoa(*port), store.RealClock{}, *sweepInterval)
 	if err := srv.Listen(); err != nil {
 		fmt.Fprintf(os.Stderr, "verdigris: %v\n", err)
 		os.Exit(1)

@@ -9,7 +9,7 @@ import (
 )
 
 func TestDelSingleKey(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	s.Set([]byte("k"), []byte("v"))
 
 	got, fault := DelHandler(s)(args("DEL", "k"))
@@ -27,7 +27,7 @@ func TestDelSingleKey(t *testing.T) {
 // TestDelMultipleKeys is the count semantics: the reply is how many keys were
 // actually removed, which is neither the argument count nor a boolean.
 func TestDelMultipleKeys(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	s.Set([]byte("k1"), []byte("v1"))
 	s.Set([]byte("k2"), []byte("v2"))
 
@@ -46,7 +46,7 @@ func TestDelMultipleKeys(t *testing.T) {
 // TestDelCountsOnlyKeysThatExisted covers the mixed case, which is what the
 // milestone's redis-cli demo exercises: DEL k1 k2 k3 with k3 absent answers 2.
 func TestDelCountsOnlyKeysThatExisted(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	s.Set([]byte("k1"), []byte("v1"))
 	s.Set([]byte("k2"), []byte("v2"))
 
@@ -65,7 +65,7 @@ func TestDelCountsOnlyKeysThatExisted(t *testing.T) {
 // TestDelMissingKeyIsNotAnError pins that deleting nothing is a success
 // reporting zero, not an error frame.
 func TestDelMissingKeyIsNotAnError(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 
 	got, fault := DelHandler(s)(args("DEL", "nothere"))
 	if fault != nil {
@@ -84,7 +84,7 @@ func TestDelMissingKeyIsNotAnError(t *testing.T) {
 // EXISTS k k yields 2. Both match Redis, and putting the tests side by side is
 // what stops a later refactor from "fixing" one of them into the other.
 func TestDelRepeatedKeyCountsOnce(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	s.Set([]byte("k"), []byte("v"))
 
 	got, fault := DelHandler(s)(args("DEL", "k", "k"))
@@ -97,7 +97,7 @@ func TestDelRepeatedKeyCountsOnce(t *testing.T) {
 }
 
 func TestDelWrongArity(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 
 	got, fault := DelHandler(s)(args("DEL"))
 	if fault != nil {
@@ -126,7 +126,7 @@ func TestDelRejectsNonBulkKey(t *testing.T) {
 
 	for _, in := range inputs {
 		t.Run(commandsTypeName(in), func(t *testing.T) {
-			s := store.New()
+			s := store.New(store.RealClock{})
 			s.Set([]byte("k"), []byte("v"))
 
 			got, fault := DelHandler(s)([]protocol.Value{protocol.BulkString([]byte("DEL")), in})
@@ -149,7 +149,7 @@ func TestDelRejectsNonBulkKey(t *testing.T) {
 // command rather than partially applying it. A DEL that removed some keys and
 // then errored would leave the client unable to tell what happened.
 func TestDelStopsAtTheFirstBadArgument(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	s.Set([]byte("a"), []byte("1"))
 	s.Set([]byte("b"), []byte("2"))
 
@@ -169,7 +169,7 @@ func TestDelStopsAtTheFirstBadArgument(t *testing.T) {
 
 // TestDelIsBinarySafe deletes a key containing bytes that are not text.
 func TestDelIsBinarySafe(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	key := []byte{0x00, 0xff, '\r', '\n'}
 	other := []byte("safe")
 	s.Set(key, []byte("v"))
@@ -197,7 +197,7 @@ func TestDelIsBinarySafe(t *testing.T) {
 // redis-cli renders an Integer as (integer) 1 and a BulkString as "1", and
 // clients branch on the type.
 func TestDelReturnsIntegerType(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	s.Set([]byte("k"), []byte("v"))
 
 	got, _ := DelHandler(s)(args("DEL", "k"))
@@ -213,7 +213,7 @@ func TestDelReturnsIntegerType(t *testing.T) {
 // TestDelDoesNotAlterOtherKeys guards against a handler that cleared the whole
 // map, which would pass a single-key test and destroy a keyspace.
 func TestDelDoesNotAlterOtherKeys(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	for _, k := range []string{"a", "b", "c", "d"} {
 		s.Set([]byte(k), []byte("value-"+k))
 	}

@@ -10,7 +10,7 @@ demo can be performed from a fresh `redis-cli` connection.
 | 2 | RESP decoder | **Done** | Decodes Simple Strings, Errors, Integers, Bulk Strings, Arrays, and the null forms | Decoded in isolation: `go test ./internal/protocol/` — the `redis-cli` demo lands in milestone 3, when the decoder is wired into the server |
 | 3 | RESP encoder + PING/ECHO | **Done** | Encodes replies; `PING` → `+PONG`, `ECHO x` → `$1\r\nx` | `redis-cli PING` returns `PONG` |
 | 4 | Store + SET/GET/DEL/EXISTS | **Done** | A concurrent-safe map with the four core commands | `redis-cli SET foo bar` then `GET foo` returns `bar` |
-| 5 | Expiration (EXPIRE/TTL) | Not started | Passive + active deletion of expired keys | `redis-cli SET k v EX 2` vanishes after 2 s |
+| 5 | Expiration (EXPIRE/TTL) | **Done** | Passive + active deletion of expired keys | `redis-cli SET k v EX 2` vanishes after 2 s |
 | 6 | RDB persistence | Not started | Point-in-time snapshot on shutdown, load on startup | Restart server, data survives |
 | 7 | AOF persistence | Not started | Append-only log of writes, replayed on startup | Kill server with SIGKILL, restart, writes survive |
 | 8 | Benchmarking | Not started | Measured PING/SET/GET throughput vs. Redis baseline | A short report in `docs/BENCHMARKS.md` |

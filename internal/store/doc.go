@@ -1,6 +1,7 @@
-// Package store holds the in-memory keyspace: the map from keys to values,
-// and the concurrency discipline that keeps it correct under simultaneous
-// access from every connection goroutine.
+// Package store holds the in-memory keyspace: the map from keys to entries,
+// the expiry bookkeeping that removes keys over time, and the concurrency
+// discipline that keeps both correct under simultaneous access from every
+// connection goroutine.
 //
 // This package is responsible for data and for the invariants that protect
 // it under concurrent access. It is NOT responsible for the network layer,
@@ -9,14 +10,14 @@
 // them a given client request maps onto. It also does not own persistence
 // formats; RDB and AOF will serialize the store, not live inside it.
 //
-// The central invariant is that the store owns its memory. Set copies both
-// the key and the value it is given, and Get hands back a fresh copy rather
-// than a view into the stored bytes. That single rule is what makes the rest
-// of the server safe without every handler having to reason about buffer
-// lifetimes: a handler may pass slices that alias the connection's read
-// buffer straight to Set, and a handler may keep whatever Get returned for as
-// long as it likes. Neither can corrupt the keyspace, and neither can be
-// corrupted by a later command.
+// The central invariant is that the store owns its memory. Set and SetWithTTL
+// copy both the key and the value they are given, and Get hands back a fresh
+// copy rather than a view into the stored bytes. That single rule is what
+// makes the rest of the server safe without every handler having to reason
+// about buffer lifetimes: a handler may pass slices that alias the
+// connection's read buffer straight to Set, and a handler may keep whatever
+// Get returned for as long as it likes. Neither can corrupt the keyspace, and
+// neither can be corrupted by a later command.
 //
 // The cost is one allocation per argument on write and one per value on read.
 // That is a deliberate trade of throughput for a contract that holds no
@@ -30,7 +31,42 @@
 // binary keys round-trip intact. Values stay []byte because they are
 // arbitrary payloads: a bulk string may hold NUL, invalid UTF-8, and CRLF.
 //
-// Milestone 4 implements this keyspace and the four commands that exercise
-// it. Milestone 5 adds expiration, which will introduce a per-key entry
-// struct to carry an expiry alongside the value.
+// # Time is injected
+//
+// The store never calls time.Now. New takes a Clock, and every expiry decision
+// reads the current time from it. Production passes RealClock{}; tests pass a
+// fake whose Now is a value the test advances. This is what makes TTL
+// behaviour testable at all: without it, proving that a key with a one-hour
+// TTL is gone would mean waiting an hour, and every test would be a sleep with
+// a timing assumption attached.
+//
+// One consequence is worth knowing when reading the code: expiry comparisons
+// are inclusive of the deadline (!now.Before(expiresAt)), so a write with a
+// TTL of zero is expired at the instant it is written rather than a tick
+// later.
+//
+// # Two deletion paths
+//
+// An expired key is removed in two ways, and both are needed.
+//
+// Passive deletion happens on access: Get, Exists, TTL and Expire notice an
+// expired entry on the way past, remove it, and report the key as absent. It
+// costs nothing extra and guarantees a reader never observes a key it
+// considers dead. On its own it leaks: a key that is written and never read
+// again would sit in the map forever.
+//
+// Active deletion is the sweeper, a background goroutine started by New and
+// stopped by Close. On a ticker it samples a bounded number of keys that have
+// an expiry and removes the expired ones, so a key nobody reads still
+// disappears. It samples rather than scans — see sweeper.go for why that
+// distinction is the whole design — which means a given expired key is not
+// guaranteed to be removed promptly, only eventually, and only if it is not
+// read first.
+//
+// # Data model
+//
+// The map is keyed by string and holds entry values. An entry carries the
+// value bytes and an absolute expiry, where the zero time means "no expiry".
+// The expiry is absolute rather than a countdown so that it needs no
+// maintenance and cannot drift when the key is untouched.
 package store

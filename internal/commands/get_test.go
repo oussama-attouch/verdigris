@@ -10,7 +10,7 @@ import (
 )
 
 func TestGetExistingKey(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	s.Set([]byte("foo"), []byte("bar"))
 
 	got, fault := GetHandler(s)(args("GET", "foo"))
@@ -31,7 +31,7 @@ func TestGetExistingKey(t *testing.T) {
 // Value and not an error: a missing key is a normal answer in Redis, and the
 // null bulk string is what redis-cli renders as (nil).
 func TestGetMissingKeyReturnsNull(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 
 	got, fault := GetHandler(s)(args("GET", "nothere"))
 	if fault != nil {
@@ -60,7 +60,7 @@ func TestGetWrongArity(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := store.New()
+			s := store.New(store.RealClock{})
 
 			got, fault := GetHandler(s)(tt.args)
 			if fault != nil {
@@ -91,7 +91,7 @@ func TestGetRejectsNonBulkKey(t *testing.T) {
 
 	for _, in := range inputs {
 		t.Run(commandsTypeName(in), func(t *testing.T) {
-			s := store.New()
+			s := store.New(store.RealClock{})
 			s.Set([]byte("foo"), []byte("bar"))
 
 			got, fault := GetHandler(s)([]protocol.Value{protocol.BulkString([]byte("GET")), in})
@@ -114,7 +114,7 @@ func TestGetRejectsNonBulkKey(t *testing.T) {
 // invariant: mutating what GET returned must not be able to reach the stored
 // bytes, because the store handed over a copy.
 func TestGetDoesNotLeakStoreMemory(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	s.Set([]byte("k"), []byte("original"))
 	h := GetHandler(s)
 
@@ -139,7 +139,7 @@ func TestGetDoesNotLeakStoreMemory(t *testing.T) {
 // TestGetIsBinarySafe checks a value with NUL, invalid UTF-8 and CRLF survives
 // the round trip through the store and the handler.
 func TestGetIsBinarySafe(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	value := []byte{0x00, 0xff, '\r', '\n', 0xfe}
 	s.Set([]byte("k"), value)
 
@@ -161,7 +161,7 @@ func TestGetIsBinarySafe(t *testing.T) {
 // like RESP traffic comes back untouched, which is the case a naive
 // implementation that re-encoded or parsed values would corrupt.
 func TestGetValueWithEmbeddedCommandBytes(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	value := []byte("*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n")
 	s.Set([]byte("k"), value)
 
@@ -180,7 +180,7 @@ func TestGetValueWithEmbeddedCommandBytes(t *testing.T) {
 // key. The reply for the first is `$0\r\n\r\n` and for the second `$-1\r\n`;
 // collapsing them would break every client that checks for nil.
 func TestGetEmptyValueIsNotMissing(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	s.Set([]byte("empty"), []byte{})
 
 	got, fault := GetHandler(s)(args("GET", "empty"))

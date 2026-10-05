@@ -20,7 +20,8 @@ func mustGet(t *testing.T, s *Store, key string) []byte {
 }
 
 func TestSetGetRoundTrip(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 	s.Set([]byte("foo"), []byte("bar"))
 
 	got := mustGet(t, s, "foo")
@@ -32,7 +33,8 @@ func TestSetGetRoundTrip(t *testing.T) {
 // TestSetOverwrites checks the second write wins and that the first value is
 // not merely shadowed but replaced.
 func TestSetOverwrites(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	s.Set([]byte("k"), []byte("first"))
 	s.Set([]byte("k"), []byte("second"))
@@ -48,7 +50,8 @@ func TestSetOverwrites(t *testing.T) {
 // TestSetOverwriteWithShorterValue catches an implementation that reused a
 // stored buffer and left a tail from the longer previous value.
 func TestSetOverwriteWithShorterValue(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	s.Set([]byte("k"), []byte("a long original value"))
 	s.Set([]byte("k"), []byte("short"))
@@ -60,7 +63,8 @@ func TestSetOverwriteWithShorterValue(t *testing.T) {
 
 // TestGetMissingKey pins the exact shape of a miss: a nil slice and false.
 func TestGetMissingKey(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	got, found := s.Get([]byte("nothere"))
 	if found {
@@ -72,7 +76,8 @@ func TestGetMissingKey(t *testing.T) {
 }
 
 func TestDeleteRemoves(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 	s.Set([]byte("k"), []byte("v"))
 
 	if !s.Delete([]byte("k")) {
@@ -92,7 +97,8 @@ func TestDeleteRemoves(t *testing.T) {
 }
 
 func TestDeleteMissingKey(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	if s.Delete([]byte("nothere")) {
 		t.Fatal("Delete on a missing key returned true, want false")
@@ -107,7 +113,8 @@ func TestDeleteMissingKey(t *testing.T) {
 // TestDeleteIsNotIdempotentInItsReturnValue pins that the second delete of the
 // same key reports false, which is what the DEL command counts.
 func TestDeleteIsNotIdempotentInItsReturnValue(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 	s.Set([]byte("k"), []byte("v"))
 
 	if !s.Delete([]byte("k")) {
@@ -120,7 +127,8 @@ func TestDeleteIsNotIdempotentInItsReturnValue(t *testing.T) {
 
 // TestExistsDistinguishesPresentFromAbsent is the whole contract of Exists.
 func TestExistsDistinguishesPresentFromAbsent(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 	s.Set([]byte("here"), []byte("v"))
 
 	if !s.Exists([]byte("here")) {
@@ -132,7 +140,8 @@ func TestExistsDistinguishesPresentFromAbsent(t *testing.T) {
 }
 
 func TestExistsOnOverwrittenKey(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	s.Set([]byte("k"), []byte("first"))
 	s.Set([]byte("k"), []byte("second"))
@@ -145,7 +154,8 @@ func TestExistsOnOverwrittenKey(t *testing.T) {
 // TestExistsOnDeletedThenRecreatedKey checks the key really is gone in
 // between, rather than Exists latching a stale answer.
 func TestExistsOnDeletedThenRecreatedKey(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 	s.Set([]byte("k"), []byte("v"))
 
 	s.Delete([]byte("k"))
@@ -163,7 +173,8 @@ func TestExistsOnDeletedThenRecreatedKey(t *testing.T) {
 }
 
 func TestLen(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	if n := s.Len(); n != 0 {
 		t.Fatalf("Len() = %d on a new store, want 0", n)
@@ -202,7 +213,8 @@ func TestLen(t *testing.T) {
 // byte sequence, not text: it may hold NUL, invalid UTF-8, and CRLF, and the
 // string conversion the implementation uses must not mangle any of it.
 func TestBinarySafeKeys(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	keys := [][]byte{
 		{0x00},
@@ -237,7 +249,8 @@ func TestBinarySafeKeys(t *testing.T) {
 
 // TestBinarySafeValues is the value half: values are raw bytes, never text.
 func TestBinarySafeValues(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	values := [][]byte{
 		{0x00},
@@ -269,7 +282,8 @@ func TestBinarySafeValues(t *testing.T) {
 // written. Without this test, an implementation that happened to allocate
 // fresh slices would pass everything else and regress silently.
 func TestSetCopiesKeyAndValue(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	key := []byte("original-key")
 	value := []byte("original-value")
@@ -299,7 +313,8 @@ func TestSetCopiesKeyAndValue(t *testing.T) {
 // mutation is shorter or longer than the original, which is where an
 // aliasing bug shows up as a length change rather than a content change.
 func TestSetCopiesKeyAndValueOfDifferentLengths(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	key := []byte("abcdefghij")
 	value := []byte("0123456789")
@@ -322,7 +337,8 @@ func TestSetCopiesKeyAndValueOfDifferentLengths(t *testing.T) {
 // stored slice, the second read would show the mutation — and a cached value
 // could be corrupted by any caller that edited what it received.
 func TestGetReturnsACopy(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 	s.Set([]byte("k"), []byte("original"))
 
 	first := mustGet(t, s, "k")
@@ -344,7 +360,8 @@ func TestGetReturnsACopy(t *testing.T) {
 // TestGetReturnsADistinctCopyEachTime checks that successive reads do not
 // share storage with each other, only with nothing.
 func TestGetReturnsADistinctCopyEachTime(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 	s.Set([]byte("k"), []byte("value"))
 
 	a := mustGet(t, s, "k")
@@ -364,7 +381,8 @@ func TestGetReturnsADistinctCopyEachTime(t *testing.T) {
 // an empty value as different things, since the RESP layer treats a null bulk
 // string and a zero-length bulk string as different frames.
 func TestNilAndEmptyValuesAreDistinct(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	s.Set([]byte("nilkey"), nil)
 	s.Set([]byte("emptykey"), []byte{})
@@ -397,7 +415,8 @@ func TestNilAndEmptyValuesAreDistinct(t *testing.T) {
 // correctness test under -race, and it is the one that would catch a missing
 // lock, a lock held too narrowly, or a map read outside the critical section.
 func TestConcurrentDisjointKeys(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	const goroutines = 16
 	const iterations = 1000
@@ -461,7 +480,8 @@ func TestConcurrentDisjointKeys(t *testing.T) {
 // one that some goroutine actually wrote. Under -race this is where a missing
 // lock turns into a crash or a reported race rather than a wrong answer.
 func TestConcurrentSameKey(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	const goroutines = 8
 	const iterations = 1000
@@ -518,7 +538,8 @@ func TestConcurrentSameKey(t *testing.T) {
 // overlapping key space, which is closer to real traffic than either of the
 // tests above: different clients write keys that sometimes collide.
 func TestConcurrentMixedKeysWithSharedPrefix(t *testing.T) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	const goroutines = 8
 	const perGoroutine = 200
@@ -571,7 +592,8 @@ func TestConcurrentMixedKeysWithSharedPrefix(t *testing.T) {
 // BenchmarkSet records the cost of a write. Nothing is optimized on the basis
 // of these numbers; they are groundwork for milestone 8.
 func BenchmarkSet(b *testing.B) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 	key := []byte("benchmark-key")
 	value := []byte("benchmark-value")
 
@@ -586,7 +608,8 @@ func BenchmarkSet(b *testing.B) {
 // BenchmarkGet records the cost of a read, which includes the copy-on-exit
 // that the ownership invariant requires.
 func BenchmarkGet(b *testing.B) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 	s.Set([]byte("benchmark-key"), []byte("benchmark-value"))
 	key := []byte("benchmark-key")
 
@@ -603,7 +626,8 @@ func BenchmarkGet(b *testing.B) {
 // BenchmarkExists records the cost of an existence check, which does no copy
 // and should therefore be the cheapest of the three operations.
 func BenchmarkExists(b *testing.B) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 	s.Set([]byte("benchmark-key"), []byte("benchmark-value"))
 	key := []byte("benchmark-key")
 
@@ -620,7 +644,8 @@ func BenchmarkExists(b *testing.B) {
 // BenchmarkSetGetParallel measures throughput under concurrent readers and
 // writers at once, which is the shape of the server's real workload.
 func BenchmarkSetGetParallel(b *testing.B) {
-	s := New()
+	s := New(RealClock{})
+	defer s.Close()
 
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {

@@ -20,6 +20,27 @@ func args(words ...string) []protocol.Value {
 	return out
 }
 
+// numericArgs builds a command whose trailing arguments are RESP Integers
+// rather than bulk strings.
+//
+// The distinction is not cosmetic. A real client sends `EXPIRE k 10` with the
+// timeout as an integer frame (`:10\r\n`), and `SET k v EX 10` the same way,
+// while the key and the option name stay bulk strings. A test that used args()
+// for these would be sending a shape no client sends and would exercise the
+// wrong branch of the handler — which is exactly what happened before this
+// helper existed.
+func numericArgs(command string, leading []string, numbers ...int64) []protocol.Value {
+	out := make([]protocol.Value, 0, 1+len(leading)+len(numbers))
+	out = append(out, protocol.BulkString([]byte(command)))
+	for _, s := range leading {
+		out = append(out, protocol.BulkString([]byte(s)))
+	}
+	for _, n := range numbers {
+		out = append(out, protocol.Integer(n))
+	}
+	return out
+}
+
 // TestPing covers every arity the handler accepts or rejects.
 func TestPing(t *testing.T) {
 	tests := []struct {
@@ -275,7 +296,7 @@ func TestHandlersWorkOnDecodedFrames(t *testing.T) {
 				t.Fatalf("Decode consumed %d of %d bytes", n, len(tt.wire))
 			}
 
-			got, fault := DefaultRegistry(store.New()).Dispatch(decoded)
+			got, fault := DefaultRegistry(store.New(store.RealClock{})).Dispatch(decoded)
 			if fault != nil {
 				t.Fatalf("Dispatch reported an internal fault: %v", fault)
 			}

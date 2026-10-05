@@ -10,7 +10,7 @@ import (
 // defaultRegistryForTest builds the registry the server uses. It exists so the
 // wiring tests read the same either way the store is obtained.
 func defaultRegistryForTest() *Registry {
-	return DefaultRegistry(store.New())
+	return DefaultRegistry(store.New(store.RealClock{}))
 }
 
 // TestCommandReturnsEmptyArray covers the stub. Real Redis returns command

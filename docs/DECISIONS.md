@@ -3,6 +3,92 @@
 Every non-obvious choice gets an entry. Format: date · decision · context ·
 alternatives · reason.
 
+## 2026-10-05 — Integral arguments accept both RESP forms
+
+Context: The milestone specification said EXPIRE's timeout "must be a RESP
+Integer (`:100\r\n`)". Implementing that literally made the milestone's own
+redis-cli demo fail on four of its twelve commands.
+
+Capturing the bytes off the wire settled it: redis-cli sends every
+command-line token as a **bulk string**. `EXPIRE k 100` arrives as
+`*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$3\r\n100\r\n` and `SET k v EX 5` as
+`*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$1\r\n5\r\n`. There is
+no RESP integer anywhere in either request.
+
+Decision: `parseIntegerArg` accepts a RESP Integer *or* a BulkString holding
+a strict base-10 integer, and every numeric argument — EXPIRE's timeout,
+SET's EX and PX counts — goes through it. Redis accepts both, and so must a
+server that claims compatibility.
+
+Reason: A handler that accepts only the integer form works with client
+libraries that know an argument is numeric and fails with redis-cli, and the
+failure looks like a server bug rather than a parsing gap, because the client
+is sending something entirely reasonable. The bulk-string path is parsed with
+strconv.ParseInt so that range errors are reported rather than wrapped.
+
+## 2026-10-05 — TTL reports at least 1 second for a live key
+
+Context: The specification required TTL to round to the nearest second, with
+`SET k v PX 500` reading as 1 rather than 0. Plain rounding does not achieve
+that: by the time the reply is built a few hundred microseconds have passed
+since the write, so 499.9 ms remains and math.Round gives 0. The server's own
+integration test caught this, and the milestone's demo would have shown it.
+
+Decision: round to the nearest second, then floor the result at 1 for any key
+that is still alive. A live key never reports 0.
+
+Reason: zero is a lie about a key that exists. The idiomatic client check
+`TTL k > 0` would conclude the key is gone while it is still readable, and
+the next GET would contradict it. Redis guarantees at least 1 second for a key
+with a TTL, and the property that no integer TTL ever contradicts a key's
+liveness is worth more than exact rounding below one second. The actual expiry
+deadline stays exact, so `PX 200` really does expire in 200 ms; only the
+reported count is floored.
+
+## 2026-10-05 — Time is injected via a Clock interface
+
+Context: Expiration requires "what time is it". A store that calls
+time.Now() directly is untestable for TTL behaviour — every TTL test would
+need a real sleep, which is slow and flaky.
+
+Decision: `store.New(clk Clock)` takes a Clock interface with a single
+`Now() time.Time` method. Production passes `store.RealClock{}`; tests pass
+a `FakeClock` whose Now() returns a value the test can advance. The store
+never calls time.Now() directly.
+
+Cost: one interface and one field on the Store. In exchange, every TTL test
+is deterministic and instant.
+
+## 2026-10-05 — Active expiration samples, does not scan
+
+Context: The naive active sweeper walks every key on every tick. With N keys
+and a 100 ms tick, that is O(N) per 100 ms — 10000 scans/sec on a 1000-key
+store, which dwarfs the actual command rate and would dominate any profile.
+
+Decision: mimic Redis's own design. On each tick, sample up to 20 keys that
+have an expiry, delete the expired ones, and if more than 25% of the sample
+was expired, repeat immediately. Bounded work per tick, and the repetition
+means a store full of expired keys drains quickly rather than at 20 keys
+per 100 ms.
+
+Alternatives: full scan (rejected — O(N) per tick); a sorted structure keyed
+by expiry time (correct but requires a second index, which the store does
+not yet have and does not need for these volumes).
+
+## 2026-10-05 — Entry struct replaces raw []byte values
+
+Context: Milestone 4 deliberately kept `map[string][]byte` and noted that
+expiration would change it. Expiration adds per-key metadata (an absolute
+expiry time), which the map cannot carry.
+
+Decision: `map[string]entry`, where `entry{value []byte, expiresAt time.Time}`
+and a zero `expiresAt` means "no expiry". Contained change inside `store.go`;
+nothing outside the package observes it.
+
+The `entry` struct is unexported. The Store's public API is unchanged except
+for the new `Expire`, `TTL`, `Persist`, `SetWithTTL`, and the
+expiration-aware `Get`/`Exists`.
+
 ## 2026-10-05 — Handler signature returns (Value, error)
 
 Context: The milestone 3 `Handler` type returned only a `protocol.Value`.

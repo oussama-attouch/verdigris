@@ -17,6 +17,7 @@ import (
 
 	"github.com/Oussama-Att/verdigris/internal/commands"
 	"github.com/Oussama-Att/verdigris/internal/protocol"
+	"github.com/Oussama-Att/verdigris/internal/store"
 )
 
 // testTimeout bounds every blocking step in these tests. It is generous
@@ -32,6 +33,19 @@ func discardLogs(t *testing.T) {
 	previous := log.Writer()
 	log.SetOutput(io.Discard)
 	t.Cleanup(func() { log.SetOutput(previous) })
+}
+
+// testSweepInterval is much shorter than the production default so that
+// active expiry is observable in a test without waiting 100 ms per round. It
+// is passed to New rather than assigned to the store package's variable, so
+// nothing global is mutated and no sweeper can be racing a write.
+const testSweepInterval = 2 * time.Millisecond
+
+// newTestServer builds a Server with the real clock and a short sweep
+// interval. Tests that need to control expiry use startServerWithClock
+// instead.
+func newTestServer() *Server {
+	return New("127.0.0.1:0", store.RealClock{}, testSweepInterval)
 }
 
 // client reads RESP replies off a connection while holding on to bytes it has
@@ -182,7 +196,7 @@ func commandFrame(words ...string) []byte {
 func startServer(t *testing.T) (addr string, shutdown func()) {
 	t.Helper()
 
-	srv := New("127.0.0.1:0")
+	srv := newTestServer()
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -601,7 +615,7 @@ func TestBufferedReaderIsNotUsedForFraming(t *testing.T) {
 func TestGracefulShutdown(t *testing.T) {
 	discardLogs(t)
 
-	srv := New("127.0.0.1:0")
+	srv := newTestServer()
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -655,7 +669,7 @@ func TestGracefulShutdown(t *testing.T) {
 func TestShutdownSignalsAbandonedConnection(t *testing.T) {
 	discardLogs(t)
 
-	srv := New("127.0.0.1:0")
+	srv := newTestServer()
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -700,7 +714,7 @@ func TestServeBeforeListen(t *testing.T) {
 	discardLogs(t)
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- New("127.0.0.1:0").Serve() }()
+	go func() { errCh <- newTestServer().Serve() }()
 
 	select {
 	case err := <-errCh:
@@ -717,7 +731,7 @@ func TestServeBeforeListen(t *testing.T) {
 func TestAddrIsPopulated(t *testing.T) {
 	discardLogs(t)
 
-	srv := New("127.0.0.1:0")
+	srv := newTestServer()
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -749,7 +763,7 @@ func TestAddrIsPopulated(t *testing.T) {
 func TestListenIsIdempotent(t *testing.T) {
 	discardLogs(t)
 
-	srv := New("127.0.0.1:0")
+	srv := newTestServer()
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("first Listen: %v", err)
 	}
@@ -789,7 +803,7 @@ func TestStartServerHelperIsIsolated(t *testing.T) {
 func TestCustomRegistryIsUsed(t *testing.T) {
 	discardLogs(t)
 
-	srv := New("127.0.0.1:0")
+	srv := newTestServer()
 	srv.registry = commands.NewRegistry() // deliberately empty
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("Listen: %v", err)
@@ -1375,4 +1389,248 @@ func readOne(conn net.Conn) (protocol.Value, error) {
 			return nil, readErr
 		}
 	}
+}
+
+// --- Milestone 5: expiration, over a real socket ----------------------------
+
+// TestExpireOverTCP checks the three replies EXPIRE and TTL can give, in one
+// connection: a TTL applied, a TTL read back, and a key with no expiry.
+func TestExpireOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(commandFrame("SET", "k", "v"))
+	c.expect(protocol.SimpleString("OK"))
+
+	// No expiry yet.
+	c.send(commandFrame("TTL", "k"))
+	c.expect(protocol.Integer(-1))
+
+	c.send(expireFrame("EXPIRE", "k", 100))
+	c.expect(protocol.Integer(1))
+
+	c.send(commandFrame("TTL", "k"))
+	got := c.next()
+	n, ok := got.(protocol.Integer)
+	if !ok {
+		t.Fatalf("TTL = %#v (%T), want protocol.Integer", got, got)
+	}
+	if n < 99 || n > 100 {
+		t.Fatalf("TTL = %d, want 99..100", n)
+	}
+
+	// EXPIRE on a key that does not exist reports 0.
+	c.send(expireFrame("EXPIRE", "nothere", 100))
+	c.expect(protocol.Integer(0))
+}
+
+// TestSetWithTTLOverTCP covers the SET ... EX form end to end.
+func TestSetWithTTLOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(setEXFrame("SET", "k", "v", "EX", 100))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(commandFrame("TTL", "k"))
+	c.expect(protocol.Integer(100))
+
+	// The value is readable while the key is alive.
+	c.send(commandFrame("GET", "k"))
+	c.expect(protocol.BulkString([]byte("v")))
+}
+
+// TestExpiredKeyGoneOverTCP is the milestone's acceptance criterion exercised
+// end to end, and the one integration test here that sleeps.
+//
+// It has to: the server runs with the real clock, so proving that a key
+// actually disappears after its deadline requires letting real time pass.
+// The sleep is 150 ms against a 100 ms TTL — long enough for the key to be
+// genuinely expired, short enough not to slow the suite. Every other
+// expiration test in the repository uses a fake clock instead.
+func TestExpiredKeyGoneOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(setEXFrame("SET", "k", "v", "PX", 100))
+	c.expect(protocol.SimpleString("OK"))
+
+	// Alive immediately after the write.
+	c.send(commandFrame("EXISTS", "k"))
+	c.expect(protocol.Integer(1))
+
+	time.Sleep(150 * time.Millisecond)
+
+	// Gone, by both read paths, and TTL reports the missing-key sentinel.
+	c.send(commandFrame("GET", "k"))
+	c.expect(protocol.Null{})
+
+	c.send(commandFrame("EXISTS", "k"))
+	c.expect(protocol.Integer(0))
+
+	c.send(commandFrame("TTL", "k"))
+	c.expect(protocol.Integer(-2))
+}
+
+// TestPersistOverTCP checks that a TTL can be removed and the key outlives it.
+func TestPersistOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(setEXFrame("SET", "k", "v", "PX", 100))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(commandFrame("PERSIST", "k"))
+	c.expect(protocol.Integer(1))
+
+	c.send(commandFrame("TTL", "k"))
+	c.expect(protocol.Integer(-1))
+
+	// The key must now survive well past the TTL it used to have.
+	time.Sleep(150 * time.Millisecond)
+
+	c.send(commandFrame("GET", "k"))
+	c.expect(protocol.BulkString([]byte("v")))
+
+	// A second PERSIST has nothing to remove.
+	c.send(commandFrame("PERSIST", "k"))
+	c.expect(protocol.Integer(0))
+}
+
+// TestSetClearsTTLOverTCP covers the Redis behaviour that a plain SET discards
+// an existing expiry, which clients rely on to make a temporary key durable.
+func TestSetClearsTTLOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(setEXFrame("SET", "k", "v1", "EX", 100))
+	c.expect(protocol.SimpleString("OK"))
+	c.send(commandFrame("TTL", "k"))
+	c.expect(protocol.Integer(100))
+
+	c.send(commandFrame("SET", "k", "v2"))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(commandFrame("TTL", "k"))
+	c.expect(protocol.Integer(-1))
+
+	c.send(commandFrame("GET", "k"))
+	c.expect(protocol.BulkString([]byte("v2")))
+}
+
+// TestTTLRoundsUpOverTCP is the rounding rule seen from a client: half a
+// second must read as 1, not 0. Truncation would report 0, which reads as
+// "expires right now" for a key with a usable lifetime left.
+func TestTTLRoundsUpOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(setEXFrame("SET", "k", "v", "PX", 500))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(commandFrame("TTL", "k"))
+	c.expect(protocol.Integer(1))
+}
+
+// TestExpireZeroDeletesOverTCP checks that EXPIRE k 0 is a delete, and that
+// the write that preceded it is gone.
+func TestExpireZeroDeletesOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(commandFrame("SET", "k", "v"))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(expireFrame("EXPIRE", "k", 0))
+	c.expect(protocol.Integer(1))
+
+	c.send(commandFrame("GET", "k"))
+	c.expect(protocol.Null{})
+}
+
+// TestExpirationIsSharedAcrossClients checks that a TTL set on one connection
+// is visible on another, the same way values are: the keyspace, and therefore
+// the expiry, belongs to the server.
+func TestExpirationIsSharedAcrossClients(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	writer := newClient(t, addr)
+	reader := newClient(t, addr)
+
+	writer.send(setEXFrame("SET", "shared", "v", "EX", 100))
+	writer.expect(protocol.SimpleString("OK"))
+
+	reader.send(commandFrame("TTL", "shared"))
+	reader.expect(protocol.Integer(100))
+
+	// And a PERSIST from the other connection is visible back.
+	reader.send(commandFrame("PERSIST", "shared"))
+	reader.expect(protocol.Integer(1))
+
+	writer.send(commandFrame("TTL", "shared"))
+	writer.expect(protocol.Integer(-1))
+}
+
+// TestExpireParseErrorOverTCP checks that a malformed timeout is a domain
+// error rather than a protocol error, so the connection survives it.
+func TestExpireParseErrorOverTCP(t *testing.T) {
+	discardLogs(t)
+	addr, _ := startServer(t)
+
+	c := newClient(t, addr)
+
+	c.send(commandFrame("SET", "k", "v"))
+	c.expect(protocol.SimpleString("OK"))
+
+	// A bulk string where an integer belongs: a client-side bug, recoverable.
+	c.send(commandFrame("EXPIRE", "k", "abc"))
+	c.mustError()
+
+	// The connection must still work.
+	c.send(commandFrame("GET", "k"))
+	c.expect(protocol.BulkString([]byte("v")))
+}
+
+// setEXFrame builds a SET with a trailing option and amount.
+//
+// The amount is encoded as a bulk string on purpose, because that is what a
+// real client sends: redis-cli transmits every command-line token as a bulk
+// string, so `SET k v EX 10` arrives as `$2\r\nEX\r\n$2\r\n10\r\n` rather
+// than with a RESP integer. Encoding it as an integer here would test a shape
+// no client produces, which is exactly how the milestone's first demo failed.
+func setEXFrame(command, key, value, option string, amount int64) []byte {
+	return protocol.Encode(protocol.Array{
+		protocol.BulkString([]byte(command)),
+		protocol.BulkString([]byte(key)),
+		protocol.BulkString([]byte(value)),
+		protocol.BulkString([]byte(option)),
+		protocol.BulkString([]byte(strconv.FormatInt(amount, 10))),
+	})
+}
+
+// expireFrame builds an EXPIRE whose timeout is a bulk string, matching
+// redis-cli. Both wire forms are covered by the command-level tests; this
+// helper follows the real client because the integration tests are about what
+// actually happens on a socket.
+func expireFrame(command, key string, seconds int64) []byte {
+	return protocol.Encode(protocol.Array{
+		protocol.BulkString([]byte(command)),
+		protocol.BulkString([]byte(key)),
+		protocol.BulkString([]byte(strconv.FormatInt(seconds, 10))),
+	})
 }

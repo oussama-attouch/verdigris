@@ -11,14 +11,20 @@
 // never touches a connection directly. Keeping it that way is what makes
 // every command unit-testable without a socket.
 //
-// Milestone 4 brings the registry to eight commands: PING, ECHO, SET, GET,
-// DEL, EXISTS, plus CLIENT and COMMAND, which exist so that modern Redis
-// clients and probing tools connect quietly rather than seeing errors they
-// cannot act on. EXPIRE and TTL arrive with expiration in milestone 5.
+// Milestone 5 brings the registry to eleven commands: PING, ECHO, SET, GET,
+// DEL, EXISTS, EXPIRE, TTL, PERSIST, plus CLIENT and COMMAND, which exist so
+// that modern Redis clients and probing tools connect quietly rather than
+// seeing errors they cannot act on. SET also gained its EX and PX forms.
 //
 // A handler returns (Value, error). The Value is the reply and is always sent
 // to the client; the error is an internal fault, which the server logs and
 // replaces with a generic message rather than forwarding. Domain errors —
 // wrong arity, a bad argument type, an unknown command — are protocol.Error
 // values with a nil error, because the client is meant to read them.
+//
+// Integral arguments are read through parseIntegerArg rather than by a type
+// assertion, because real clients send them in both RESP forms: redis-cli
+// transmits `EXPIRE k 100` with the timeout as a bulk string, while a client
+// library may send a RESP integer. Accepting only one form works with half the
+// clients and looks like a server bug to the other half.
 package commands

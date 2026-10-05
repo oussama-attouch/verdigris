@@ -8,7 +8,7 @@ import (
 )
 
 func TestExistsSingleKey(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	s.Set([]byte("k"), []byte("v"))
 
 	got, fault := ExistsHandler(s)(args("EXISTS", "k"))
@@ -21,7 +21,7 @@ func TestExistsSingleKey(t *testing.T) {
 }
 
 func TestExistsMissingKey(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 
 	got, fault := ExistsHandler(s)(args("EXISTS", "nothere"))
 	if fault != nil {
@@ -36,7 +36,7 @@ func TestExistsMissingKey(t *testing.T) {
 }
 
 func TestExistsMultipleKeys(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	s.Set([]byte("a"), []byte("1"))
 	s.Set([]byte("b"), []byte("2"))
 
@@ -57,7 +57,7 @@ func TestExistsMultipleKeys(t *testing.T) {
 // many of these are present" probe. It is also the deliberate opposite of DEL,
 // where a repeated key is removed once.
 func TestExistsCountsDuplicateKeysTwice(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	s.Set([]byte("k"), []byte("v"))
 
 	got, fault := ExistsHandler(s)(args("EXISTS", "k", "k"))
@@ -79,7 +79,7 @@ func TestExistsCountsDuplicateKeysTwice(t *testing.T) {
 // TestExistsRepeatedMissingKeyCountsZero is the mirror case: a duplicate of a
 // key that does not exist still contributes nothing.
 func TestExistsRepeatedMissingKeyCountsZero(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 
 	got, fault := ExistsHandler(s)(args("EXISTS", "nothere", "nothere"))
 	if fault != nil {
@@ -91,7 +91,7 @@ func TestExistsRepeatedMissingKeyCountsZero(t *testing.T) {
 }
 
 func TestExistsWrongArity(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 
 	got, fault := ExistsHandler(s)(args("EXISTS"))
 	if fault != nil {
@@ -120,7 +120,7 @@ func TestExistsRejectsNonBulkKey(t *testing.T) {
 
 	for _, in := range inputs {
 		t.Run(commandsTypeName(in), func(t *testing.T) {
-			s := store.New()
+			s := store.New(store.RealClock{})
 			s.Set([]byte("k"), []byte("v"))
 
 			got, fault := ExistsHandler(s)([]protocol.Value{protocol.BulkString([]byte("EXISTS")), in})
@@ -142,7 +142,7 @@ func TestExistsRejectsNonBulkKey(t *testing.T) {
 // TestExistsReturnsIntegerType checks the reply type, since redis-cli renders
 // an Integer as (integer) 1 and a BulkString as "1".
 func TestExistsReturnsIntegerType(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	s.Set([]byte("k"), []byte("v"))
 
 	got, _ := ExistsHandler(s)(args("EXISTS", "k"))
@@ -157,7 +157,7 @@ func TestExistsReturnsIntegerType(t *testing.T) {
 
 // TestExistsIsBinarySafe probes a key containing bytes that are not text.
 func TestExistsIsBinarySafe(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 	key := []byte{0x00, 0xff, '\r', '\n'}
 	s.Set(key, []byte("v"))
 
@@ -176,7 +176,7 @@ func TestExistsIsBinarySafe(t *testing.T) {
 // TestExistsDoesNotCreateKeys guards against an implementation that used Set
 // or an upsert to answer the question.
 func TestExistsDoesNotCreateKeys(t *testing.T) {
-	s := store.New()
+	s := store.New(store.RealClock{})
 
 	if _, fault := ExistsHandler(s)(args("EXISTS", "nothere")); fault != nil {
 		t.Fatalf("EXISTS reported an internal fault: %v", fault)
