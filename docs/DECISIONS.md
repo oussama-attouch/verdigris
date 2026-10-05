@@ -3,6 +3,27 @@
 Every non-obvious choice gets an entry. Format: date · decision · context ·
 alternatives · reason.
 
+## 2026-10-05 — RESP values: sealed interface with concrete types
+
+Context: A decoded RESP frame must be representable in Go in a way that the
+command layer can switch on and the encoder can serialize back. Three shapes
+were considered.
+
+Alternatives:
+- `interface{}` with ad-hoc type assertions at call sites. Un-typed, easy to
+  mis-cast at runtime, no help from the compiler.
+- A single tagged struct with a Kind enum and per-kind fields. Simple, but
+  permits constructing invalid values (Kind: BulkString with the Integer
+  field set), and forces every consumer to check Kind before every field
+  access.
+- A sealed interface with one concrete type per RESP type. Chosen.
+
+Reason: concrete types make invalid states unrepresentable, match how
+encoding/json models tagged unions, and give the command layer a natural
+type switch. Adding RESP3 types later (Map, Set, Boolean, Double) is a new
+type, not a change to a shared struct. The cost — a package-level interface
+and six small types — is trivial against the clarity it buys.
+
 ## 2026-10-05 — gcc on PATH requires a per-invocation preamble
 
 Context: The DSH harness environment block is captured at session start

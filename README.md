@@ -4,9 +4,9 @@ A Redis-compatible key-value store, written from scratch in Go.
 
 ## Status
 
-Milestone 1 complete. The server accepts raw TCP connections and echoes
-bytes back verbatim, line by line. No RESP parsing, no data store, no
-commands yet.
+Milestones 1–2 complete. The server accepts raw TCP connections and echoes
+bytes back verbatim. The RESP decoder is implemented and tested. No RESP
+encoder yet, no data store, no commands.
 
 ## Why
 
