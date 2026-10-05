@@ -3,6 +3,17 @@
 Every non-obvious choice gets an entry. Format: date · decision · context ·
 alternatives · reason.
 
+## 2026-10-05 — gcc on PATH requires a per-invocation preamble
+
+Context: The DSH harness environment block is captured at session start
+and does not reflect PATH changes made during the session. Every pwsh
+tool call inherits that stale block, so gcc is not on PATH unless the
+current invocation sets it explicitly.
+
+Reason: A one-line preamble reads Machine + User PATH fresh from the
+registry and assigns it to $env:Path. It works regardless of harness
+state and matches the pattern any Windows CI runner uses.
+
 ## 2026-10-05 — Race detector enabled via user-level MinGW-w64
 
 Context: go test -race requires cgo, which requires a C compiler. Chocolatey
