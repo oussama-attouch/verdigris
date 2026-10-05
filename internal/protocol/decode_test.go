@@ -791,3 +791,81 @@ func TestDecodeNegativeBulkLengths(t *testing.T) {
 		})
 	}
 }
+
+// FuzzDecode asserts the one invariant the hand-written tests cannot cover
+// exhaustively: Decode must never panic, on any input whatsoever.
+//
+// The semantic tests are deliberate and finite; a fuzzer is the systematic
+// version of the instinct that found milestone 2's overflow bug, where a
+// 21-byte packet declaring a MaxInt64 length wrapped a bounds comparison
+// negative and produced an out-of-range slice panic.
+//
+// This target deliberately asserts no semantics. A random byte string is
+// almost never a valid RESP frame, so demanding a particular value or error
+// would fail constantly and teach the fuzzer nothing. It checks only the two
+// contract properties that must hold for every possible input:
+//
+//   - Decode returns, rather than panicking.
+//   - The consumed count is inside the buffer, and is exactly zero whenever
+//     the error is ErrIncomplete.
+//
+// Run the exploratory search with:
+//
+//	go test -run=^$ -fuzz=FuzzDecode -fuzztime=60s ./internal/protocol/
+//
+// Without -fuzz, Go runs the seed corpus as ordinary test cases, so these
+// seeds are part of every normal `go test ./...`.
+func FuzzDecode(f *testing.F) {
+	// Seed from the existing test corpus so the fuzzer starts from
+	// interesting inputs rather than random bytes.
+	seeds := []string{
+		"+OK\r\n",
+		"-ERR unknown\r\n",
+		":0\r\n",
+		":-9223372036854775808\r\n",
+		"$0\r\n\r\n",
+		"$5\r\nhello\r\n",
+		"$-1\r\n",
+		"*-1\r\n",
+		"*0\r\n",
+		"*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n",
+		"*2\r\n*2\r\n:1\r\n:2\r\n:3\r\n",
+		"$9223372036854775807\r\n",
+		"*1000000\r\n",
+	}
+	for _, s := range seeds {
+		f.Add([]byte(s))
+	}
+	f.Add([]byte{0x00, 0xff, 0x0d, 0x0a, 0xfe})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// The only invariant: Decode must not panic, on any input.
+		// Whether the input is a valid frame is not the fuzzer's concern —
+		// the semantic tests cover that.
+		_, n, err := Decode(data)
+
+		if err == nil {
+			// If decode succeeded, consumed bytes must be in range.
+			if n < 0 || n > len(data) {
+				t.Fatalf("Decode returned consumed=%d for input of length %d", n, len(data))
+			}
+		}
+		if errors.Is(err, ErrIncomplete) {
+			// Incomplete frames are contractually zero-consumed.
+			if n != 0 {
+				t.Fatalf("ErrIncomplete with consumed=%d, expected 0", n)
+			}
+		}
+
+		// A ProtocolError reports how far it got, which must also be inside
+		// the buffer. Decode computes this from the cursor position, so a
+		// future refactor that advanced the cursor past the end would be
+		// caught here rather than only in the offset assertions.
+		var perr *ProtocolError
+		if errors.As(err, &perr) {
+			if perr.Offset < 0 || perr.Offset > len(data) {
+				t.Fatalf("ProtocolError offset %d is outside a %d-byte input", perr.Offset, len(data))
+			}
+		}
+	})
+}

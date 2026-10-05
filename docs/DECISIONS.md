@@ -3,6 +3,25 @@
 Every non-obvious choice gets an entry. Format: date · decision · context ·
 alternatives · reason.
 
+## 2026-10-05 — Fuzz target for the RESP decoder
+
+Context: Milestone 2's hand-written tests found a real overflow bug —
+`n+2 > int64(c.len())` wraps negative on MaxInt64 input, causing a slice
+panic from a 21-byte packet. That bug was found because a specific test was
+written to look for it. A fuzz target is the systematic version of that
+instinct.
+
+Reason: `Decode` is a pure []byte → Value function with no state and no
+setup, which is the ideal shape for fuzzing. The target asserts exactly one
+invariant — Decode must not panic — and the seed corpus is the hand-written
+test suite. Go's fuzzing is part of the standard toolchain, so this adds no
+dependency and no build complexity.
+
+Scope note: the fuzzer is bounded to 60 seconds in milestone 2. It is not
+run as part of `go test ./...` (Go's fuzzing infra runs the seed corpus in
+normal mode, but exploratory fuzzing is a separate invocation). A future
+milestone may run it for longer in CI once the surface area grows.
+
 ## 2026-10-05 — RESP values: sealed interface with concrete types
 
 Context: A decoded RESP frame must be representable in Go in a way that the
