@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -18,7 +20,7 @@ import (
 // version is a placeholder. It will be populated from build metadata in a
 // later milestone. For now it exists so the binary has something to print
 // and so the build can be verified end to end.
-const version = "0.4.0-milestone5"
+const version = "0.5.0-milestone6"
 
 // shutdownTimeout bounds how long a graceful shutdown may take before
 // in-flight connections are cut off.
@@ -28,6 +30,8 @@ func main() {
 	port := flag.Int("port", server.DefaultPort, "TCP port to listen on (1-65535)")
 	sweepInterval := flag.Duration("sweep-interval", store.DefaultSweepInterval,
 		"how often the active expiration sweeper runs (e.g. 100ms, 1s)")
+	rdbPath := flag.String("rdb-path", "",
+		"path to the RDB snapshot file (empty disables persistence)")
 	flag.Parse()
 
 	// A port outside the range is a usage error, not a runtime failure, so it
@@ -48,6 +52,17 @@ func main() {
 		os.Exit(2)
 	}
 
+	// A path whose directory does not exist is a usage error too, and it is
+	// worth catching here rather than at the first save for two reasons: the
+	// first save might be hours into a run, and on shutdown there is nowhere
+	// useful left to report it. The file itself is allowed not to exist —
+	// that is a first run.
+	if err := checkRDBParent(*rdbPath); err != nil {
+		fmt.Fprintf(os.Stderr, "verdigris: %v\n", err)
+		flag.Usage()
+		os.Exit(2)
+	}
+
 	// Printed before the listener starts, so an operator looking at a running
 	// process can confirm which build it is.
 	fmt.Fprintf(os.Stdout, "verdigris %s\n", version)
@@ -56,7 +71,18 @@ func main() {
 	// the same thing redis-server does by default. The clock is the real one:
 	// expiry in production follows wall-clock time, and injecting a clock is
 	// for the tests.
-	srv := server.New(":"+strconv.Itoa(*port), store.RealClock{}, *sweepInterval)
+	//
+	// Construction loads the snapshot, so a corrupt or unreadable file stops
+	// the process before a single connection is accepted. That ordering is the
+	// point: a client must never observe a server that is up but has silently
+	// lost its data.
+	srv, err := server.New(":"+strconv.Itoa(*port), store.RealClock{}, *sweepInterval, *rdbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "verdigris: %v\n", err)
+		os.Exit(1)
+	}
+	defer srv.Close()
+
 	if err := srv.Listen(); err != nil {
 		fmt.Fprintf(os.Stderr, "verdigris: %v\n", err)
 		os.Exit(1)
@@ -105,4 +131,29 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+// checkRDBParent reports whether the snapshot's directory exists, so that a
+// typo in -rdb-path is caught at startup rather than at the first save.
+//
+// An empty path disables persistence and has no directory to check. The file
+// itself is deliberately not required to exist: a missing snapshot is a first
+// run, and the loader treats it as one.
+func checkRDBParent(path string) error {
+	if path == "" {
+		return nil
+	}
+
+	dir := filepath.Dir(path)
+	info, err := os.Stat(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("invalid -rdb-path %s: directory %s does not exist", path, dir)
+		}
+		return fmt.Errorf("invalid -rdb-path %s: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("invalid -rdb-path %s: %s is not a directory", path, dir)
+	}
+	return nil
 }

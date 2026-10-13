@@ -72,7 +72,7 @@ func TestDispatchIsCaseInsensitive(t *testing.T) {
 }
 
 func TestDispatchUnknownCommand(t *testing.T) {
-	r := DefaultRegistry(store.New(store.RealClock{}))
+	r := DefaultRegistry(store.New(store.RealClock{}), nil)
 
 	got, fault := r.Dispatch(protocol.Array{protocol.BulkString([]byte("NOTACOMMAND"))})
 	if fault != nil {
@@ -92,7 +92,7 @@ func TestDispatchUnknownCommand(t *testing.T) {
 // redis-cli demo asserts. A client sending lower case must still see the name
 // upper-cased, because that is what Redis echoes back.
 func TestDispatchUnknownCommandIsUppercased(t *testing.T) {
-	r := DefaultRegistry(store.New(store.RealClock{}))
+	r := DefaultRegistry(store.New(store.RealClock{}), nil)
 
 	got, fault := r.Dispatch(protocol.Array{protocol.BulkString([]byte("notacommand"))})
 	if fault != nil {
@@ -106,7 +106,7 @@ func TestDispatchUnknownCommandIsUppercased(t *testing.T) {
 }
 
 func TestDispatchRejectsNonArray(t *testing.T) {
-	r := DefaultRegistry(store.New(store.RealClock{}))
+	r := DefaultRegistry(store.New(store.RealClock{}), nil)
 
 	// A bare bulk string, a simple string, an integer, a null, and nil are
 	// all things a client could put on the wire that are not commands.
@@ -137,7 +137,7 @@ func TestDispatchRejectsNonArray(t *testing.T) {
 }
 
 func TestDispatchRejectsEmptyArray(t *testing.T) {
-	r := DefaultRegistry(store.New(store.RealClock{}))
+	r := DefaultRegistry(store.New(store.RealClock{}), nil)
 
 	got, fault := r.Dispatch(protocol.Array{})
 	if fault != nil {
@@ -150,7 +150,7 @@ func TestDispatchRejectsEmptyArray(t *testing.T) {
 }
 
 func TestDispatchRejectsNonBulkCommandName(t *testing.T) {
-	r := DefaultRegistry(store.New(store.RealClock{}))
+	r := DefaultRegistry(store.New(store.RealClock{}), nil)
 
 	// Real clients always send the command name as a bulk string. An integer,
 	// a simple string, a nested array, or a null in that position is a
@@ -253,7 +253,7 @@ func TestDispatchPropagatesInternalFault(t *testing.T) {
 // the one that is easy to get backwards: a handler returning a protocol.Error
 // is answering the client correctly, and must not be reported as a bug.
 func TestDispatchDomainErrorsAreNotFaults(t *testing.T) {
-	r := DefaultRegistry(store.New(store.RealClock{}))
+	r := DefaultRegistry(store.New(store.RealClock{}), nil)
 
 	for _, in := range []protocol.Value{
 		protocol.Array{protocol.BulkString([]byte("PING")), protocol.BulkString([]byte("a")), protocol.BulkString([]byte("b"))},
@@ -272,10 +272,10 @@ func TestDispatchDomainErrorsAreNotFaults(t *testing.T) {
 }
 
 func TestNames(t *testing.T) {
-	r := DefaultRegistry(store.New(store.RealClock{}))
+	r := DefaultRegistry(store.New(store.RealClock{}), nil)
 
 	got := r.Names()
-	want := []string{"CLIENT", "COMMAND", "DEL", "ECHO", "EXISTS", "EXPIRE", "GET", "PERSIST", "PING", "SET", "TTL"}
+	want := []string{"CLIENT", "COMMAND", "DEL", "ECHO", "EXISTS", "EXPIRE", "GET", "PERSIST", "PING", "SAVE", "SET", "TTL"}
 
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Names() = %v, want %v", got, want)
@@ -331,9 +331,9 @@ func TestRegisterDuplicatePanics(t *testing.T) {
 // TestDefaultRegistryHasTheBuiltins checks the registry the server actually
 // uses, so a missing Register call fails here rather than over the wire.
 func TestDefaultRegistryHasTheBuiltins(t *testing.T) {
-	r := DefaultRegistry(store.New(store.RealClock{}))
+	r := DefaultRegistry(store.New(store.RealClock{}), nil)
 
-	for _, name := range []string{"PING", "ECHO", "SET", "GET", "DEL", "EXISTS", "EXPIRE", "TTL", "PERSIST", "CLIENT", "COMMAND"} {
+	for _, name := range []string{"PING", "ECHO", "SET", "GET", "DEL", "EXISTS", "EXPIRE", "TTL", "PERSIST", "SAVE", "CLIENT", "COMMAND"} {
 		got, fault := r.Dispatch(protocol.Array{
 			protocol.BulkString([]byte(name)),
 			protocol.BulkString([]byte("a")),
@@ -352,7 +352,7 @@ func TestDefaultRegistryHasTheBuiltins(t *testing.T) {
 		}
 	}
 
-	want := []string{"CLIENT", "COMMAND", "DEL", "ECHO", "EXISTS", "EXPIRE", "GET", "PERSIST", "PING", "SET", "TTL"}
+	want := []string{"CLIENT", "COMMAND", "DEL", "ECHO", "EXISTS", "EXPIRE", "GET", "PERSIST", "PING", "SAVE", "SET", "TTL"}
 	if names := r.Names(); !reflect.DeepEqual(names, want) {
 		t.Fatalf("DefaultRegistry names = %v, want %v", names, want)
 	}
@@ -362,7 +362,7 @@ func TestDefaultRegistryHasTheBuiltins(t *testing.T) {
 // from one goroutine per connection. Under -race this fails loudly if the map
 // is read without the lock.
 func TestDispatchIsSafeForConcurrentUse(t *testing.T) {
-	r := DefaultRegistry(store.New(store.RealClock{}))
+	r := DefaultRegistry(store.New(store.RealClock{}), nil)
 
 	const goroutines = 8
 	const iterations = 200

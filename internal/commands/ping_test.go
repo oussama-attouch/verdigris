@@ -296,7 +296,7 @@ func TestHandlersWorkOnDecodedFrames(t *testing.T) {
 				t.Fatalf("Decode consumed %d of %d bytes", n, len(tt.wire))
 			}
 
-			got, fault := DefaultRegistry(store.New(store.RealClock{})).Dispatch(decoded)
+			got, fault := DefaultRegistry(store.New(store.RealClock{}), nil).Dispatch(decoded)
 			if fault != nil {
 				t.Fatalf("Dispatch reported an internal fault: %v", fault)
 			}

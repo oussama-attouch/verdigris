@@ -9,6 +9,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/Oussama-Att/verdigris/internal/commands"
 	"github.com/Oussama-Att/verdigris/internal/protocol"
+	"github.com/Oussama-Att/verdigris/internal/rdb"
 	"github.com/Oussama-Att/verdigris/internal/store"
 )
 
@@ -41,11 +44,31 @@ func discardLogs(t *testing.T) {
 // nothing global is mutated and no sweeper can be racing a write.
 const testSweepInterval = 2 * time.Millisecond
 
-// newTestServer builds a Server with the real clock and a short sweep
-// interval. Tests that need to control expiry use startServerWithClock
-// instead.
-func newTestServer() *Server {
-	return New("127.0.0.1:0", store.RealClock{}, testSweepInterval)
+// newTestServer builds a Server with the real clock, a short sweep interval,
+// and no persistence.
+//
+// Tests that need to control expiry pass their own store, and tests that need
+// persistence use newTestServerAt; this helper is for the majority that care
+// about neither.
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
+	return newTestServerAt(t, "")
+}
+
+// newTestServerAt builds a Server with a specific snapshot path.
+//
+// New can fail, which is the point of the signature: a corrupt or unreadable
+// file must stop construction. A test helper that swallowed that error would
+// hide the failure mode the milestone exists to establish, so a failure here
+// is fatal to the test.
+func newTestServerAt(t *testing.T, rdbPath string) *Server {
+	t.Helper()
+
+	srv, err := New("127.0.0.1:0", store.RealClock{}, testSweepInterval, rdbPath)
+	if err != nil {
+		t.Fatalf("New(rdbPath=%q): %v", rdbPath, err)
+	}
+	return srv
 }
 
 // client reads RESP replies off a connection while holding on to bytes it has
@@ -187,19 +210,347 @@ func commandFrame(words ...string) []byte {
 	return protocol.Encode(args)
 }
 
-// startServer binds 127.0.0.1:0 and begins serving.
+// testServer is a running server plus a record of every client connection a
+// test opened against it.
+type testServer struct {
+	srv      *Server
+	addr     string
+	conns    []net.Conn
+	shutdown func()
+}
+
+// client dials the server and records the connection so that a later shutdown
+// closes it.
+//
+// The bookkeeping is not tidiness. Shutdown waits for in-flight connections to
+// drain, and an idle client connection is in flight, so a test that shuts the
+// server down while a client is still open waits out the entire drain timeout.
+// That is correct behaviour from the server and a slow, misleading test from
+// the client's side — and it is exactly what happened before this helper
+// existed. The milestone 1 shutdown tests close their client by hand for the
+// same reason; this makes it automatic.
+func (ts *testServer) client(t *testing.T) *client {
+	t.Helper()
+
+	c := newClient(t, ts.addr)
+	ts.conns = append(ts.conns, c.conn)
+	return c
+}
+
+// closeConnections closes every connection this test opened.
+func (ts *testServer) closeConnections() {
+	for _, conn := range ts.conns {
+		_ = conn.Close()
+	}
+	ts.conns = nil
+}
+
+// startServerWithRDB binds 127.0.0.1:0 with persistence at rdbPath and begins
+// serving. It is startTestServer with the snapshot path supplied, for the tests
+// that need the server to load from and save to a real file.
+//
+// New can fail here, and the helper does not swallow that: a corrupt or
+// unreadable file must stop construction, and a test helper that hid the
+// failure would hide the behaviour the milestone exists to establish.
+func startServerWithRDB(t *testing.T, rdbPath string) *testServer {
+	t.Helper()
+	return serveTestServer(t, newTestServerAt(t, rdbPath))
+}
+
+// --- Milestone 6: persistence, over a real socket ---------------------------
+
+// TestSaveAndReloadOverTCP is the milestone's headline test.
+//
+// A server writes keys and saves; a second server, constructed against the
+// same file, must come up holding them. It is the whole acceptance criterion
+// reduced to Go.
+func TestSaveAndReloadOverTCP(t *testing.T) {
+	discardLogs(t)
+	path := filepath.Join(t.TempDir(), "snapshot.rdb")
+
+	// --- First server: write and save.
+	ts := startServerWithRDB(t, path)
+
+	c := ts.client(t)
+	c.send(commandFrame("SET", "plain", "value"))
+	c.expect(protocol.SimpleString("OK"))
+	c.send(commandFrame("SET", "counted", "42"))
+	c.expect(protocol.SimpleString("OK"))
+	c.send(setEXFrame("SET", "timed", "later", "EX", 3600))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(commandFrame("SAVE"))
+	c.expect(protocol.SimpleString("OK"))
+
+	ts.shutdown()
+
+	// --- Second server: the same file, a fresh process-equivalent.
+	ts2 := startServerWithRDB(t, path)
+	defer ts2.shutdown()
+
+	c2 := ts2.client(t)
+
+	c2.send(commandFrame("GET", "plain"))
+	c2.expect(protocol.BulkString([]byte("value")))
+
+	c2.send(commandFrame("GET", "counted"))
+	c2.expect(protocol.BulkString([]byte("42")))
+
+	// The TTL survived as an absolute deadline, so it is close to an hour
+	// rather than reset to one.
+	c2.send(commandFrame("TTL", "timed"))
+	got := c2.next()
+	n, ok := got.(protocol.Integer)
+	if !ok {
+		t.Fatalf("TTL = %#v (%T), want protocol.Integer", got, got)
+	}
+	// Generous because the shutdown above waited for a live connection to
+	// drain before saving, which legitimately consumed seconds of the hour
+	// this TTL was set to.
+	if n < 3580 || n > 3600 {
+		t.Fatalf("TTL after reload = %d, want 3580..3600", n)
+	}
+}
+
+// TestShutdownSavesWithoutAnExplicitSAVE checks the other save trigger: a
+// graceful shutdown writes the snapshot even if the client never asked.
+//
+// This is the Ctrl-C path the manual demo exercises, and the one that matters
+// most, because an operator stopping a server is not going to remember to run
+// SAVE first.
+func TestShutdownSavesWithoutAnExplicitSAVE(t *testing.T) {
+	discardLogs(t)
+	path := filepath.Join(t.TempDir(), "snapshot.rdb")
+
+	ts := startServerWithRDB(t, path)
+
+	c := ts.client(t)
+	c.send(commandFrame("SET", "k", "v"))
+	c.expect(protocol.SimpleString("OK"))
+
+	ts.shutdown() // no SAVE command
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("no snapshot was written on shutdown: %v", err)
+	}
+
+	// And a new server loads what shutdown wrote.
+	ts2 := startServerWithRDB(t, path)
+	defer ts2.shutdown()
+
+	c2 := ts2.client(t)
+	c2.send(commandFrame("GET", "k"))
+	c2.expect(protocol.BulkString([]byte("v")))
+}
+
+// TestExpiredKeysAreNotSaved checks that the snapshot omits what the store
+// considers dead, so a restart does not resurrect expired keys.
+func TestExpiredKeysAreNotSaved(t *testing.T) {
+	discardLogs(t)
+	path := filepath.Join(t.TempDir(), "snapshot.rdb")
+
+	ts := startServerWithRDB(t, path)
+
+	c := ts.client(t)
+
+	// One key that lives, one that is already dead by the time of the save.
+	c.send(commandFrame("SET", "live", "v"))
+	c.expect(protocol.SimpleString("OK"))
+	c.send(setEXFrame("SET", "dying", "v", "PX", 50))
+	c.expect(protocol.SimpleString("OK"))
+
+	time.Sleep(120 * time.Millisecond)
+
+	c.send(commandFrame("SAVE"))
+	c.expect(protocol.SimpleString("OK"))
+
+	ts.shutdown()
+
+	ts2 := startServerWithRDB(t, path)
+	defer ts2.shutdown()
+
+	c2 := ts2.client(t)
+	c2.send(commandFrame("GET", "live"))
+	c2.expect(protocol.BulkString([]byte("v")))
+	c2.send(commandFrame("GET", "dying"))
+	c2.expect(protocol.Null{})
+}
+
+// TestSaveFaultIsInternalError checks the fault channel end to end: a save
+// that fails must produce the generic ERR internal error rather than a panic,
+// a hang, or the filesystem's own message.
+func TestSaveFaultIsInternalError(t *testing.T) {
+	discardLogs(t)
+
+	// A registry whose save function always fails, wired the way the server
+	// wires its own. The failure text is distinctive so the test can prove it
+	// did not reach the client.
+	secret := "the-disk-is-on-fire-do-not-leak-me"
+	s := store.New(store.RealClock{})
+	t.Cleanup(s.Close)
+
+	registry := commands.DefaultRegistry(s, func() error { return errors.New(secret) })
+
+	reply, fault := registry.Dispatch(protocol.Array{protocol.BulkString([]byte("SAVE"))})
+
+	if fault == nil {
+		t.Fatal("a failing save produced no internal fault")
+	}
+	if !strings.Contains(fault.Error(), secret) {
+		t.Fatalf("the fault does not carry the underlying error: %v", fault)
+	}
+	if reply != nil {
+		t.Fatalf("a faulted dispatch returned a reply: %#v", reply)
+	}
+}
+
+// TestStartupFailsOnCorruptFile is the other half of the corruption contract:
+// a bad file must stop the server rather than being treated as no file.
+//
+// A server that silently started empty would look healthy while the operator's
+// data sat on disk unread, and the next save would overwrite it.
+func TestStartupFailsOnCorruptFile(t *testing.T) {
+	discardLogs(t)
+
+	// A file with the right name and the wrong contents.
+	path := filepath.Join(t.TempDir(), "corrupt.rdb")
+	if err := os.WriteFile(path, []byte("this is not a snapshot"), 0o600); err != nil {
+		t.Fatalf("write corrupt file: %v", err)
+	}
+
+	_, err := New("127.0.0.1:0", store.RealClock{}, testSweepInterval, path)
+	if err == nil {
+		t.Fatal("New succeeded against a corrupt snapshot")
+	}
+	if !errors.Is(err, rdb.ErrCorrupt) {
+		t.Fatalf("error = %v, want it to wrap rdb.ErrCorrupt", err)
+	}
+
+	// The file is still there: a failed startup must not delete evidence.
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("the corrupt file was removed: %v", statErr)
+	}
+}
+
+// TestStartupSucceedsWhenFileIsMissing checks the other side of that branch: a
+// missing snapshot is a first run, not an error.
+func TestStartupSucceedsWhenFileIsMissing(t *testing.T) {
+	discardLogs(t)
+
+	path := filepath.Join(t.TempDir(), "not-yet.rdb")
+
+	srv := newTestServerAt(t, path)
+	srv.Close()
+
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("constructing a server created a file: %v", err)
+	}
+}
+
+// TestNoPersistenceWithoutFlag checks that an empty path means no file I/O at
+// all: no file is read, and shutdown writes nothing.
+func TestNoPersistenceWithoutFlag(t *testing.T) {
+	discardLogs(t)
+
+	// A directory that must stay empty. If the server wrote anywhere, this is
+	// where it would show up as a file the test did not put there.
+	dir := t.TempDir()
+
+	ts := startTestServer(t)
+
+	c := ts.client(t)
+	c.send(commandFrame("SET", "k", "v"))
+	c.expect(protocol.SimpleString("OK"))
+
+	// SAVE with no path configured is a no-op that reports success, because
+	// there is nothing to save to and nothing the client could do about it.
+	c.send(commandFrame("SAVE"))
+	c.expect(protocol.SimpleString("OK"))
+
+	ts.shutdown()
+
+	names, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(names) != 0 {
+		t.Fatalf("a server without -rdb-path wrote %d files into the temp directory", len(names))
+	}
+}
+
+// TestSaveAndLoadBinaryAndNilValues checks the binary-safety and nil/empty
+// distinctions survive a real save and load through a real server, not just
+// the rdb package's own round trip.
+func TestSaveAndLoadBinaryAndNilValues(t *testing.T) {
+	discardLogs(t)
+	path := filepath.Join(t.TempDir(), "snapshot.rdb")
+
+	ts := startServerWithRDB(t, path)
+
+	key := []byte{0x00, 0xff, '\r', '\n'}
+	value := []byte{0xff, 0x00, '\r', '\n', 0xfe}
+
+	c := ts.client(t)
+	c.send(commandFrame("SET", string(key), string(value)))
+	c.expect(protocol.SimpleString("OK"))
+	c.send(commandFrame("SET", "empty", ""))
+	c.expect(protocol.SimpleString("OK"))
+
+	c.send(commandFrame("SAVE"))
+	c.expect(protocol.SimpleString("OK"))
+
+	ts.shutdown()
+
+	ts2 := startServerWithRDB(t, path)
+	defer ts2.shutdown()
+
+	c2 := ts2.client(t)
+
+	c2.send(commandFrame("GET", string(key)))
+	c2.expect(protocol.BulkString(value))
+
+	// An empty value must come back as `$0\r\n\r\n`, not as the null used for
+	// a missing key.
+	c2.send(commandFrame("GET", "empty"))
+	got := c2.next()
+	bs, ok := got.(protocol.BulkString)
+	if !ok {
+		t.Fatalf("GET of a stored empty value = %#v (%T), want BulkString", got, got)
+	}
+	if bs == nil {
+		t.Fatal("a stored empty value came back as nil after a save and load")
+	}
+	if len(bs) != 0 {
+		t.Fatalf("a stored empty value came back as %q", bs)
+	}
+}
+
+// startTestServer binds 127.0.0.1:0 with no persistence and begins serving,
+// tracking the connections a test opens so that shutdown can close them.
 //
 // Port 0 asks the kernel for a free port, so tests never collide with a real
 // Verdigris on 6379, with a redis-server, or with each other. Cleanup shuts
-// the server down and waits for Serve to return, so a failing test cannot
-// leak a listener or a goroutine.
-func startServer(t *testing.T) (addr string, shutdown func()) {
+// the server down and waits for Serve to return, so a failing test cannot leak
+// a listener or a goroutine.
+func startTestServer(t *testing.T) *testServer {
+	t.Helper()
+	return serveTestServer(t, newTestServer(t))
+}
+
+// serveTestServer runs an already-constructed Server and returns a handle that
+// shuts it down.
+//
+// Both startTestServer and startServerWithRDB funnel through here, so the
+// drain-then-close ordering and the shutdown handshake exist in one place
+// rather than three.
+func serveTestServer(t *testing.T, srv *Server) *testServer {
 	t.Helper()
 
-	srv := newTestServer()
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
+
+	ts := &testServer{srv: srv, addr: srv.Addr().String()}
 
 	serveDone := make(chan error, 1)
 	// serving is closed by the goroutine the instant it starts, so this
@@ -214,8 +565,14 @@ func startServer(t *testing.T) (addr string, shutdown func()) {
 	<-serving
 
 	var once sync.Once
-	shutdown = func() {
+	ts.shutdown = func() {
 		once.Do(func() {
+			// Close the test's own clients before draining. See
+			// testServer.client for why this is load-bearing rather than
+			// tidy: an idle connection is an in-flight connection, and the
+			// drain would wait out the whole timeout for it.
+			ts.closeConnections()
+
 			ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 			defer cancel()
 			if err := srv.Shutdown(ctx); err != nil {
@@ -232,9 +589,18 @@ func startServer(t *testing.T) (addr string, shutdown func()) {
 		})
 	}
 
-	t.Cleanup(shutdown)
+	t.Cleanup(ts.shutdown)
 
-	return srv.Addr().String(), shutdown
+	return ts
+}
+
+// startServer is startTestServer's older interface, kept because most tests
+// only want the address and never shut the server down by hand.
+func startServer(t *testing.T) (addr string, shutdown func()) {
+	t.Helper()
+
+	ts := startTestServer(t)
+	return ts.addr, ts.shutdown
 }
 
 // --- Task 6: the required integration tests ---------------------------------
@@ -615,7 +981,7 @@ func TestBufferedReaderIsNotUsedForFraming(t *testing.T) {
 func TestGracefulShutdown(t *testing.T) {
 	discardLogs(t)
 
-	srv := newTestServer()
+	srv := newTestServer(t)
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -669,7 +1035,7 @@ func TestGracefulShutdown(t *testing.T) {
 func TestShutdownSignalsAbandonedConnection(t *testing.T) {
 	discardLogs(t)
 
-	srv := newTestServer()
+	srv := newTestServer(t)
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -714,7 +1080,7 @@ func TestServeBeforeListen(t *testing.T) {
 	discardLogs(t)
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- newTestServer().Serve() }()
+	go func() { errCh <- newTestServer(t).Serve() }()
 
 	select {
 	case err := <-errCh:
@@ -731,7 +1097,7 @@ func TestServeBeforeListen(t *testing.T) {
 func TestAddrIsPopulated(t *testing.T) {
 	discardLogs(t)
 
-	srv := newTestServer()
+	srv := newTestServer(t)
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -763,7 +1129,7 @@ func TestAddrIsPopulated(t *testing.T) {
 func TestListenIsIdempotent(t *testing.T) {
 	discardLogs(t)
 
-	srv := newTestServer()
+	srv := newTestServer(t)
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("first Listen: %v", err)
 	}
@@ -803,7 +1169,7 @@ func TestStartServerHelperIsIsolated(t *testing.T) {
 func TestCustomRegistryIsUsed(t *testing.T) {
 	discardLogs(t)
 
-	srv := newTestServer()
+	srv := newTestServer(t)
 	srv.registry = commands.NewRegistry() // deliberately empty
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("Listen: %v", err)

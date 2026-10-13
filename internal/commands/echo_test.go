@@ -139,7 +139,7 @@ func TestEchoRoundTripsThroughTheWire(t *testing.T) {
 		t.Fatalf("Decode consumed %d of %d bytes", n, len(wire))
 	}
 
-	reply, fault := DefaultRegistry(store.New(store.RealClock{})).Dispatch(decoded)
+	reply, fault := DefaultRegistry(store.New(store.RealClock{}), nil).Dispatch(decoded)
 	if fault != nil {
 		t.Fatalf("Dispatch reported an internal fault: %v", fault)
 	}
@@ -168,7 +168,7 @@ func TestEchoBinarySafeThroughTheWire(t *testing.T) {
 		t.Fatalf("Decode error: %v", err)
 	}
 
-	reply, fault := DefaultRegistry(store.New(store.RealClock{})).Dispatch(decoded)
+	reply, fault := DefaultRegistry(store.New(store.RealClock{}), nil).Dispatch(decoded)
 	if fault != nil {
 		t.Fatalf("Dispatch reported an internal fault: %v", fault)
 	}

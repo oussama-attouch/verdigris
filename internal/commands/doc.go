@@ -11,10 +11,15 @@
 // never touches a connection directly. Keeping it that way is what makes
 // every command unit-testable without a socket.
 //
-// Milestone 5 brings the registry to eleven commands: PING, ECHO, SET, GET,
-// DEL, EXISTS, EXPIRE, TTL, PERSIST, plus CLIENT and COMMAND, which exist so
-// that modern Redis clients and probing tools connect quietly rather than
-// seeing errors they cannot act on. SET also gained its EX and PX forms.
+// Milestone 6 brings the registry to twelve commands: PING, ECHO, SET, GET,
+// DEL, EXISTS, EXPIRE, TTL, PERSIST, SAVE, plus CLIENT and COMMAND, which
+// exist so that modern Redis clients and probing tools connect quietly rather
+// than seeing errors they cannot act on.
+//
+// SAVE is the first command that needs anything from outside the store, and it
+// gets it through a SaveFunc parameter on DefaultRegistry rather than by
+// importing the server. The handler calls the function and reports its error
+// as an internal fault; it does not know what a file is.
 //
 // A handler returns (Value, error). The Value is the reply and is always sent
 // to the client; the error is an internal fault, which the server logs and

@@ -120,7 +120,15 @@ func (r *Registry) Names() []string {
 // registry is a lookup table and knows nothing about data; only the handlers
 // that need state capture it. PING, ECHO, CLIENT and COMMAND take the store
 // and ignore it, which keeps the wiring uniform.
-func DefaultRegistry(s *store.Store) *Registry {
+//
+// save is the function SAVE invokes, and it is a parameter for the same
+// reason: the registry has no business knowing that persistence exists. A nil
+// save registers a handler that reports an internal fault if called, which is
+// what a test that only cares about other commands wants — but production
+// always passes a real one, and the server registers its own Save immediately
+// after construction so that no reachable moment exists where SAVE is absent
+// or broken.
+func DefaultRegistry(s *store.Store, save SaveFunc) *Registry {
 	r := NewRegistry()
 	r.Register("PING", Ping)
 	r.Register("ECHO", Echo)
@@ -133,5 +141,21 @@ func DefaultRegistry(s *store.Store) *Registry {
 	r.Register("PERSIST", PersistHandler(s))
 	r.Register("CLIENT", ClientHandler())
 	r.Register("COMMAND", CommandHandler())
+
+	if save == nil {
+		// The handler still exists, so PING and every other command behave
+		// identically whether or not persistence is wired. Only a SAVE that
+		// nobody can service fails, and it fails as an internal fault rather
+		// than as an unknown command — the command is understood, the server
+		// simply has nothing to save to.
+		save = func() error { return errNoSaveFunc }
+	}
+	r.Register("SAVE", SaveHandler(save))
+
 	return r
 }
+
+// errNoSaveFunc reports a SAVE reaching a registry that was built without a
+// save function. It is a programming error in the caller, not a client error,
+// so it travels the internal-fault channel.
+var errNoSaveFunc = errors.New("commands: no save function registered")

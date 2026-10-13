@@ -8,12 +8,14 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Oussama-Att/verdigris/internal/commands"
 	"github.com/Oussama-Att/verdigris/internal/protocol"
+	"github.com/Oussama-Att/verdigris/internal/rdb"
 	"github.com/Oussama-Att/verdigris/internal/store"
 )
 
@@ -65,10 +67,16 @@ type Server struct {
 	addr string
 
 	// store is the keyspace every connection on this server shares, held so
-	// that Shutdown can stop its expiration sweeper. The handlers also hold
-	// it, handed over through the registry; this reference exists for
-	// lifecycle, not for data access.
+	// that Shutdown can stop its expiration sweeper and so Save can read it.
+	// The handlers also hold it, handed over through the registry; this
+	// reference exists for lifecycle and persistence, not for command
+	// dispatch.
 	store *store.Store
+
+	// rdbPath is the snapshot file, or empty when persistence is disabled.
+	// An empty path makes both load and save no-ops rather than errors, so
+	// the rest of the server never has to ask whether persistence is on.
+	rdbPath string
 
 	// registry routes decoded commands to handlers. It is set by New and read
 	// by every connection goroutine; a Registry is safe for concurrent use,
@@ -135,40 +143,122 @@ type Server struct {
 // sweepInterval is how often the store's active expiration sweeper runs. A
 // non-positive value uses the store's default.
 //
+// rdbPath is the snapshot file. An empty path disables persistence entirely:
+// nothing is loaded and nothing is written. A non-empty path is loaded here,
+// during construction, so that a client which connects the instant Listen
+// returns sees the restored keyspace rather than an empty one — and so that a
+// corrupt file stops the process before it ever accepts a connection.
+//
 // The returned Server answers the built-in commands (see
 // commands.DefaultRegistry) against a store created here. One store is
 // created and handed to the registry, whose handlers close over it, so every
 // connection this server accepts shares one keyspace — the property that
 // makes two clients see each other's writes.
-func New(addr string, clk store.Clock, sweepInterval time.Duration) *Server {
+//
+// It returns an error only for a persistence failure: an unreadable or corrupt
+// snapshot. A missing file is not an error — it means this is the first run.
+func New(addr string, clk store.Clock, sweepInterval time.Duration, rdbPath string) (*Server, error) {
 	if clk == nil {
 		clk = store.RealClock{}
 	}
 
-	// Constructing the store once and handing the same pointer to the
-	// registry is the whole mechanism by which two clients see each other's
-	// writes. The server also keeps the pointer, so Shutdown can stop the
-	// sweeper goroutine the store started.
+	// The registry is built with the server's own Save, which is the one place
+	// a command reaches back into the server. s.Save is a method value, so it
+	// binds the receiver before the struct is fully assembled — which is what
+	// makes it possible to pass here at all, and why the registry does not
+	// need a second Register call afterwards.
 	//
-	// The interval goes in as an argument rather than through a package-level
-	// setter, so this store's tick period is stated on the line that builds
-	// it. A non-positive value is normalised inside the store.
+	// The alternative — the store owning the path and exposing Save itself —
+	// would put a filesystem path inside the keyspace, which currently knows
+	// nothing about durability; see docs/DECISIONS.md for the tradeoff.
 	kv := store.NewWithInterval(clk, sweepInterval)
 
-	return &Server{
-		addr:     addr,
-		store:    kv,
-		registry: commands.DefaultRegistry(kv),
-		done:     make(chan struct{}),
+	s := &Server{
+		addr:    addr,
+		store:   kv,
+		rdbPath: rdbPath,
+		done:    make(chan struct{}),
 	}
+	s.registry = commands.DefaultRegistry(kv, s.Save)
+
+	if err := s.load(); err != nil {
+		// The sweeper started by NewWithInterval is running and would outlive
+		// a failed construction, so it is stopped before returning. A caller
+		// that receives an error here has nothing to close.
+		kv.Close()
+		return nil, err
+	}
+
+	return s, nil
+}
+
+// load reads the snapshot into the store. An empty path or a missing file is
+// not an error; anything else is.
+func (s *Server) load() error {
+	if s.rdbPath == "" {
+		return nil
+	}
+
+	entries, err := rdb.Read(s.rdbPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// First run. Not an error, and not silently ignored either — it is
+			// simply the expected state of a server starting with persistence
+			// enabled before anything has been saved.
+			log.Printf("no snapshot at %s; starting empty", s.rdbPath)
+			return nil
+		}
+		// A corrupt or unreadable file is fatal. Falling back to an empty
+		// keyspace would be the worst possible answer: the operator would see
+		// a working server and conclude their data had been lost by something
+		// else, while the bad file sat there ready to fail again on the next
+		// restart.
+		return err
+	}
+
+	// Load holds the store's write lock until the returned function is
+	// called. Nothing else can touch the keyspace until then, which is the
+	// strongest available statement that startup is single-threaded.
+	unlock := s.store.Load(entries)
+	unlock()
+
+	log.Printf("loaded %d keys from %s", len(entries), s.rdbPath)
+	return nil
+}
+
+// Save writes the current keyspace to the snapshot file. An empty rdbPath
+// makes it a no-op that reports success, so a caller does not have to check
+// whether persistence is enabled before asking for a save.
+//
+// This is exported because the SAVE command needs it: the handler receives
+// this method as a SaveFunc and has no other route to the filesystem. It is
+// the one place a command reaches back into the server, and the alternative —
+// the store owning the path — is recorded in docs/DECISIONS.md.
+//
+// Snapshot takes the store's read lock and returns copies, so this runs
+// without blocking readers and without aliasing live data. The write itself
+// happens outside any store lock: serializing a large keyspace while holding
+// the keyspace would stall every client for the duration of a disk write.
+func (s *Server) Save() error {
+	if s.rdbPath == "" {
+		return nil
+	}
+
+	entries := s.store.Snapshot()
+	if err := rdb.Write(s.rdbPath, entries); err != nil {
+		return err
+	}
+
+	log.Printf("saved %d keys to %s", len(entries), s.rdbPath)
+	return nil
 }
 
 // Close stops the store's active expiration sweeper. It does not clear the
 // keyspace, and it is safe to call more than once.
 //
-// Shutdown calls this after draining connections. A caller that never started
-// listening — a Server constructed and discarded — must call this directly,
-// or the sweeper goroutine outlives it.
+// Shutdown calls this after draining connections and saving. A caller that
+// never started listening — a Server constructed and discarded — must call
+// this directly, or the sweeper goroutine outlives it.
 func (s *Server) Close() {
 	s.store.Close()
 }
@@ -252,9 +342,17 @@ func (s *Server) Serve() error {
 // It is safe to call more than once and safe to call from a goroutine other
 // than the one running Serve.
 //
-// The store's expiration sweeper is stopped on every path out, including both
-// error paths, which is why the Close is deferred rather than placed at the
-// end: a timeout during draining must not leave a background goroutine behind.
+// The snapshot is written after the connections have drained and before this
+// returns, on both the clean path and the drain-timeout path: a shutdown that
+// gave up on a stuck client has still stopped accepting new writes, and
+// discarding everything the server was holding because one connection was slow
+// would be the wrong trade. A save failure on the timeout path is folded into
+// the returned error rather than replacing it, so the caller learns both that
+// draining timed out and that the snapshot did not land.
+//
+// The sweeper is stopped on every path out — hence the deferred Close — so a
+// timeout during draining cannot leave a background goroutine behind. Close
+// runs after the save, because the save reads the keyspace the sweeper guards.
 func (s *Server) Shutdown(ctx context.Context) (err error) {
 	defer s.Close()
 
@@ -292,7 +390,7 @@ func (s *Server) Shutdown(ctx context.Context) (err error) {
 
 	for {
 		if s.drained() {
-			return nil
+			return s.saveOnShutdown(nil)
 		}
 		select {
 		case <-ctx.Done():
@@ -303,11 +401,29 @@ func (s *Server) Shutdown(ctx context.Context) (err error) {
 			// Closing a net.Conn is documented as safe while another
 			// goroutine is blocked reading from it.
 			s.closeAllConns()
-			return ctx.Err()
+			return s.saveOnShutdown(ctx.Err())
 		case <-ticker.C:
 			// Re-check whether the handlers have finished.
 		}
 	}
+}
+
+// saveOnShutdown writes the snapshot and combines the outcome with err, which
+// is either nil or the reason draining gave up.
+//
+// Both failures are reported rather than one overwriting the other: "shutdown
+// timed out" and "the snapshot could not be written" are independent facts,
+// and an operator seeing only the first would not know their data is still on
+// disk only up to the previous save.
+func (s *Server) saveOnShutdown(err error) error {
+	saveErr := s.Save()
+	if saveErr == nil {
+		return err
+	}
+	if err == nil {
+		return saveErr
+	}
+	return errors.Join(err, saveErr)
 }
 
 // handleConnection owns one client connection for its whole life: setup, the

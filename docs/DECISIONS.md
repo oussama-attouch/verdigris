@@ -3,6 +3,88 @@
 Every non-obvious choice gets an entry. Format: date · decision · context ·
 alternatives · reason.
 
+## 2026-10-05 — RDB file format: magic + version + count + entries + CRC32
+
+Context: The store needs a file format that round-trips keys, values, and
+expiry times without losing binary-safety, and that a future change can
+evolve without invalidating old files.
+
+Decision: a simple binary format.
+
+    magic       9 bytes  "VERDIGRIS"
+    version     1 byte   currently 1
+    count       8 bytes  big-endian uint64
+    entries     count × entry
+    crc32       4 bytes  big-endian uint32, over everything above
+
+    entry:
+      expiresAt   8 bytes  big-endian int64 nanoseconds since Unix epoch,
+                           or 0 if no expiry
+      nilFlag     1 byte   1 when the value was nil, 0 otherwise
+      keyLen      4 bytes  big-endian uint32
+      key         keyLen bytes
+      valLen      4 bytes  big-endian uint32
+      value       valLen bytes
+
+Big-endian throughout, matching every standard network protocol. The
+version byte lets a future milestone change the format without rejecting
+old files outright. The CRC lets corruption be detected rather than
+silently producing garbage data.
+
+Alternatives: mimic Redis's RDB format exactly (large, complex, has
+opcodes and version-specific quirks that add no demonstration value); JSON
+(loses binary-safety, blows up size); a key-value text format (same
+problem). The chosen format is small enough to read end-to-end in a minute
+and covers every case the store can produce.
+
+The nilFlag byte is an addition to the original layout, made after the
+round-trip test caught it: a nil value and an empty value both have zero
+length, so without a flag the two collapse into one on disk. They are not
+interchangeable, because the RESP layer renders them as `$-1` (null) and
+`$0` (empty), which clients branch on. Without the flag a restart would
+silently turn every nil value into an empty one.
+
+## 2026-10-05 — The server owns the snapshot path, not the store
+
+Context: SAVE has to reach the filesystem from a command handler, which
+means something must own the path and the load/save logic. Two shapes were
+possible: give the store a path and let it expose Load and Save, or keep
+the path in the server and have the server do the file I/O through
+rdb.Write and rdb.Read.
+
+Decision: the server owns the path. `Server.Save` reads the store's
+snapshot and writes it; the SAVE handler receives that method as a
+SaveFunc. The store knows nothing about files, and the rdb package knows
+nothing about either.
+
+Reason: the store is a keyspace with a documented ownership invariant and
+no other knowledge of the outside world. Giving it a filesystem path would
+mean the data structure also decides when durability happens, which is a
+server-lifecycle question: the snapshot is taken at shutdown after
+connections drain, and via a command that has to be routed to the running
+process. Keeping the path in the server leaves the store importable and
+testable with no filesystem at all, and it puts the one boundary crossing
+(a command reaching back into the server) in a single, named place —
+SaveFunc — rather than spreading it through the keyspace.
+
+Cost: SAVE is the first command that needs the server, so
+commands.DefaultRegistry takes a SaveFunc parameter. That is the seam, and
+it is explicit rather than implicit.
+
+## 2026-10-05 — RDB saves on shutdown and via SAVE, not periodically
+
+Context: Redis saves on a schedule (seconds-changes and changes-keys
+heuristics) in addition to shutdown. A scheduled save is stateful, couples
+the store to a background timer with its own config surface, and adds a
+failure mode (partial writes) that this milestone does not need to
+demonstrate.
+
+Decision: RDB saves on graceful shutdown (SIGINT/SIGTERM) and in response
+to the SAVE command. No periodic save.
+
+Consequence: a hard kill (SIGKILL) loses writes since the last SAVE, and
+this is documented as a limitation. Milestone 7's AOF closes that gap.
+
 ## 2026-10-05 — Integral arguments accept both RESP forms
 
 Context: The milestone specification said EXPIRE's timeout "must be a RESP

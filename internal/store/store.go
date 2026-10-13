@@ -3,6 +3,8 @@ package store
 import (
 	"sync"
 	"time"
+
+	"github.com/Oussama-Att/verdigris/internal/rdb"
 )
 
 // entry is one key's value and its expiry.
@@ -291,3 +293,134 @@ func (s *Store) Len() int {
 	defer s.mu.RUnlock()
 	return len(s.data)
 }
+
+// Count returns the number of live entries: those present and not expired.
+//
+// It is O(N) where Len is O(1), because answering it means checking every
+// entry against the clock. That is the price of a number that agrees with what
+// a snapshot would contain, which is exactly what a caller reporting "how many
+// keys were saved" needs.
+func (s *Store) Count() int {
+	now := s.clk.Now()
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	live := 0
+	for _, e := range s.data {
+		if !e.expired(now) {
+			live++
+		}
+	}
+	return live
+}
+
+// Snapshot returns every live entry in the store as of the store's current
+// clock time. Expired entries are omitted. The order is unspecified.
+//
+// Expired entries are filtered here rather than swept first. The sweeper
+// samples — it visits at most twenty expiring keys per tick — so making the
+// snapshot depend on it would mean either waiting an unknown number of ticks
+// or doing a full scan purely to delete, and then scanning again to
+// serialize. Serialization visits every entry anyway, so a per-entry check
+// costs one comparison against a time already in hand.
+//
+// The clock is read exactly once, before the lock is taken, and that single
+// instant decides every entry. Reading it per entry would make the snapshot
+// describe no particular moment: an entry could be judged live at the start of
+// the loop and expired by the end, so two entries whose deadlines differ by a
+// nanosecond could be decided by the order the map happened to yield them.
+//
+// The returned entries are deep copies and are owned by the caller. This
+// differs from the shallow-copy alternative, and the reason is the store's own
+// invariant: once a value enters the store the caller cannot reach its bytes,
+// and Snapshot is a caller. Handing out aliases would mean a snapshot held
+// across a concurrent Set could change underneath it, and that a caller
+// holding a snapshot could mutate the live keyspace — both of which the
+// package's central promise exists to prevent. The alternative saves one
+// allocation per entry on a path that runs once per SAVE and once per
+// shutdown.
+func (s *Store) Snapshot() []rdb.Entry {
+	now := s.clk.Now()
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	entries := make([]rdb.Entry, 0, len(s.data))
+	for k, e := range s.data {
+		if e.expired(now) {
+			continue
+		}
+
+		// Both copies are explicit. A nil value stays nil so that a
+		// snapshot of a key holding a nil value round-trips as one, which
+		// matters because the RESP layer distinguishes nil from empty.
+		var value []byte
+		if e.value != nil {
+			value = make([]byte, len(e.value))
+			copy(value, e.value)
+		}
+
+		entries = append(entries, rdb.Entry{
+			Key:       []byte(k),
+			Value:     value,
+			ExpiresAt: e.expiresAt,
+		})
+	}
+	return entries
+}
+
+// Load inserts entries into the store. It is intended to be called exactly
+// once, at startup, before the store is used concurrently. It is not safe
+// for concurrent use with other operations.
+//
+// Expiry times are preserved. An entry whose expiry has already passed is
+// inserted with its original deadline rather than being dropped: passive
+// deletion removes it on first access, which is what a live store that had
+// received the same SET and EXPIRE commands would do. Dropping it here would
+// also quietly discard the entry from any subsequent snapshot, so a key would
+// vanish from the file after one restart even though its deadline was in the
+// future when it was written.
+//
+// Loading does not clear the store. A second Load adds to what is there,
+// overwriting individual keys, which makes Load usable for anything that
+// later wants to merge snapshots and keeps the startup path from being a
+// special case that destroys data if it runs twice.
+//
+// The returned function releases the lock Load takes. The lock is held rather
+// than released inside Load so that the "not safe for concurrent use" contract
+// is enforced by the runtime instead of by this comment: while the returned
+// Unlocker is outstanding, every other store operation blocks.
+func (s *Store) Load(entries []rdb.Entry) Unlocker {
+	// Keys and values are copied on the way in, like every other write path.
+	// rdb.Read already copies out of the file buffer, so this is a second
+	// copy of the same bytes for the load path specifically; it is kept
+	// because Store.Load is an exported method that accepts slices from any
+	// caller, and a variant with a "the caller promises not to touch these"
+	// rule is exactly the kind of contract that holds until it does not.
+	s.mu.Lock()
+
+	for _, e := range entries {
+		var value []byte
+		if e.Value != nil {
+			value = make([]byte, len(e.Value))
+			copy(value, e.Value)
+		}
+
+		s.data[string(e.Key)] = entry{
+			value:     value,
+			expiresAt: e.ExpiresAt,
+		}
+	}
+
+	return s.mu.Unlock
+}
+
+// Unlocker releases a lock held by Load.
+//
+// It exists so that Load can hold the store's write lock across the whole
+// insertion — rather than taking and releasing it per entry — while making the
+// release the caller's explicit responsibility. Handing back the unlock
+// function is the idiomatic way to say "this is held, and here is how you let
+// go".
+type Unlocker func()

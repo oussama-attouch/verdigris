@@ -69,4 +69,35 @@
 // value bytes and an absolute expiry, where the zero time means "no expiry".
 // The expiry is absolute rather than a countdown so that it needs no
 // maintenance and cannot drift when the key is untouched.
+//
+// # Snapshots
+//
+// Snapshot returns the live keyspace as a slice of rdb.Entry, and Load inserts
+// such a slice back. They are the store's only interface to persistence, and
+// they are deliberately value-shaped: the store does not know that a file
+// exists, which path it lives at, or when a save happens. That belongs to the
+// server, which owns the lifecycle question of when a snapshot is taken.
+//
+// Two details of Snapshot are worth knowing.
+//
+// The clock is read exactly once per call, and that single instant decides
+// every entry. Reading it per entry would mean an entry's fate depended on how
+// many entries the map happened to yield before it — and Go deliberately
+// randomizes map iteration order, so the same keyspace would produce different
+// snapshots on consecutive calls.
+//
+// Expired entries are filtered during serialization rather than swept first.
+// The sweeper samples twenty expiring keys per tick, so making the snapshot
+// depend on it would mean waiting an unknown number of ticks or doing a full
+// scan purely to delete, then scanning again to serialize. Serialization
+// visits every entry anyway, so the check costs one comparison per entry
+// against a time already in hand.
+//
+// Load preserves expiry times and does not clear what is already there, so a
+// second Load merges rather than replacing. An entry whose deadline has
+// already passed is loaded anyway: it will be removed by passive deletion on
+// first access, exactly as it would have been had the server received the same
+// commands without restarting. Dropping it during load would mean a key
+// silently vanished from every later snapshot, losing data that was correct
+// when it was written.
 package store
