@@ -1,13 +1,76 @@
 <!doctype html>
 <html lang="fr">
-<head><meta charset="utf-8"><title>Verdigris UI</title></head>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Verdigris</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
 <body>
-  <h1>Verdigris UI</h1>
-  <p>Front-end coming in Part 3.</p>
-  <ul>
-    <li><a href="/api/health">/api/health</a></li>
-    <li><a href="/api/keys">/api/keys</a></li>
-    <li><a href="/api/dump">/api/dump</a></li>
-  </ul>
+  <header class="app-header">
+    <h1 class="app-header__title">Verdigris</h1>
+    <div class="app-header__controls">
+      <span id="status-pill" class="pill pill--unknown">
+        <span class="pill__dot"></span>
+        <span id="status-text" class="pill__text">Connecting</span>
+      </span>
+      <button id="refresh-button" type="button" class="button">Refresh</button>
+      <button id="save-button" type="button" class="button">Save</button>
+      <label class="checkbox">
+        <input id="auto-refresh" type="checkbox" checked>
+        Auto-refresh
+      </label>
+    </div>
+  </header>
+
+  <div id="error-banner" class="banner" role="alert" hidden></div>
+
+  <main class="app-main">
+    <section class="panel">
+      <h2 id="form-title" class="panel__title">Add a key</h2>
+
+      <form id="key-form" class="key-form" autocomplete="off">
+        <div class="key-form__field">
+          <label class="key-form__label" for="key-input">Key</label>
+          <input id="key-input" class="input input--mono" name="key" type="text" required>
+        </div>
+
+        <div class="key-form__field">
+          <label class="key-form__label" for="value-input">Value</label>
+          <input id="value-input" class="input input--mono" name="value" type="text">
+        </div>
+
+        <div class="key-form__field key-form__field--ttl">
+          <label class="key-form__label" for="ttl-input">TTL (s)</label>
+          <input id="ttl-input" class="input input--mono" name="ttl" type="number" min="1" step="1" placeholder="none">
+        </div>
+
+        <div class="key-form__actions">
+          <button id="submit-button" class="button button--primary" type="submit">Set</button>
+          <button id="cancel-button" class="button" type="button" hidden>Cancel</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel">
+      <table id="keys-table" class="keys-table">
+        <thead>
+          <tr>
+            <th scope="col">Key</th>
+            <th scope="col">Value</th>
+            <th scope="col" class="keys-table__cell--ttl">TTL</th>
+            <th scope="col" class="keys-table__cell--actions">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="keys-tbody"></tbody>
+      </table>
+
+      <p id="empty-state" class="empty-state" hidden>No keys yet. Set one above.</p>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

@@ -166,6 +166,26 @@ pure RESP server. It comes up even when Verdigris is down — `/api/health`
 reports `{"verdigris":"down"}` and the client reconnects on the first command
 that succeeds, so a UI started first will pick up a server that appears later.
 
+![The Verdigris UI: a connection pill, an add/edit form, and the keyspace as a table](docs/screenshots/ui.png)
+
+Open <http://127.0.0.1:8080> and you get one page: a connection pill that
+tracks `/api/health`, an add/edit form, and the keyspace as a table with an
+Edit and a Delete button per row. Refresh re-fetches everything, Save asks
+Verdigris to write a snapshot, and auto-refresh polls every five seconds until
+you untick it — or until a request fails, which pauses it and shows a banner
+rather than retrying at a broken server forever. TTL is shown as it was
+observed on the last refresh (`—` for no expiry, `gone` for a key that
+disappeared), deliberately without a countdown: the number is a point-in-time
+reading, and a locally animated one would be inventing data.
+
+The front-end is three static files — `web/index.html`, `web/styles.css`,
+`web/app.js` — with no framework, no build step, and nothing loaded from a CDN.
+It is served by the same `http.FileServer` as everything else, so what is in
+`web/` is exactly what the browser receives. Every key and value is written
+into the document with `textContent`, never `innerHTML`: a client can store
+`<script>alert('xss')</script>` under any name, and an admin UI is the one
+place an operator is guaranteed to look at it.
+
 The JSON API behind the page:
 
 | Method | Path | Purpose |

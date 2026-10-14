@@ -1,0 +1,389 @@
+/* Verdigris admin UI.
+ *
+ * One stylesheet, plain CSS, no framework. Colour tokens live at :root and are
+ * swapped wholesale by the light-theme block at the bottom, so no rule below
+ * mentions a colour directly.
+ */
+
+:root {
+  /* Dark is the default. The light block at the end of this file overrides
+   * these same tokens when the operating system asks for a light theme. */
+  --bg: #0e1116;
+  --surface: #161b22;
+  --surface-raised: #1c2129;
+  --border: #21262d;
+  --text: #e6edf3;
+  --text-muted: #8b949e;
+  --accent: #4ec9b0;
+  --accent-contrast: #06231d;
+  --success: #3fb950;
+  --danger: #f85149;
+  --danger-surface: #2d1416;
+
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Ubuntu,
+    Cantarell, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", "Fira Code", Consolas, monospace;
+
+  --radius: 6px;
+  --gap: 16px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0 var(--gap) 48px;
+  max-width: 1100px;
+  margin-inline: auto;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+/* --- header ------------------------------------------------------------- */
+
+.app-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap);
+  padding: 24px 0 16px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 24px;
+}
+
+.app-header__title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--accent);
+}
+
+.app-header__controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+/* --- status pill -------------------------------------------------------- */
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 11px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.pill__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex: none;
+}
+
+/* The dot carries the state as well as the text does, because a glance at a
+ * colour is faster than reading a word — which is the whole point of a status
+ * pill. The text stays for anyone who cannot rely on the colour. */
+.pill--connected .pill__dot {
+  background: var(--success);
+}
+
+.pill--disconnected .pill__dot {
+  background: var(--danger);
+}
+
+.pill--connected .pill__text {
+  color: var(--success);
+}
+
+.pill--disconnected .pill__text {
+  color: var(--danger);
+}
+
+/* --- buttons and inputs -------------------------------------------------- */
+
+.button {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.button:hover {
+  border-color: var(--text-muted);
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.button--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-contrast);
+  font-weight: 600;
+}
+
+.button--primary:hover {
+  filter: brightness(1.08);
+}
+
+.button--danger {
+  color: var(--danger);
+}
+
+.button--danger:hover {
+  border-color: var(--danger);
+}
+
+.button--small {
+  padding: 3px 10px;
+  font-size: 13px;
+}
+
+.input {
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 14px;
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.input--mono {
+  font-family: var(--font-mono);
+}
+
+.checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+/* --- error banner ------------------------------------------------------- */
+
+.banner {
+  margin-bottom: 20px;
+  padding: 11px 14px;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  background: var(--danger-surface);
+  color: var(--danger);
+  font-size: 14px;
+}
+
+/* --- panels ------------------------------------------------------------- */
+
+.app-main {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.panel {
+  min-width: 0;
+}
+
+.panel__title {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+/* --- form --------------------------------------------------------------- */
+
+.key-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.key-form__field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+/* The TTL and the buttons do not need to grow with the key and value fields;
+ * letting them stretch would push the Set button away from what it submits. */
+.key-form__field--ttl {
+  flex: 0 0 110px;
+}
+
+.key-form__label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.key-form__actions {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+/* --- table -------------------------------------------------------------- */
+
+.keys-table {
+  width: 100%;
+  border-collapse: collapse;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.keys-table th {
+  padding: 9px 14px;
+  text-align: left;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-raised);
+}
+
+.keys-table td {
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.keys-table__row:last-child td {
+  border-bottom: none;
+}
+
+.keys-table__row:hover td {
+  background: var(--surface-raised);
+}
+
+/* The row being edited is tinted with the accent so it is obvious which key
+ * the form above is about to overwrite. */
+.keys-table__row--editing td {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.keys-table__cell--key,
+.keys-table__cell--value {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  /* A long value must wrap rather than force the table wider than the page,
+   * and must break mid-token: keys and values have no spaces to break at. */
+  overflow-wrap: anywhere;
+}
+
+.keys-table__cell--key {
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.keys-table__cell--ttl {
+  width: 90px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.keys-table__cell--actions {
+  width: 150px;
+  white-space: nowrap;
+}
+
+.keys-table__cell--actions .button + .button {
+  margin-left: 6px;
+}
+
+.ttl--gone {
+  color: var(--danger);
+}
+
+/* --- empty state -------------------------------------------------------- */
+
+.empty-state {
+  margin: 0;
+  padding: 40px 16px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  text-align: center;
+  color: var(--text-muted);
+}
+
+/* --- toast -------------------------------------------------------------- */
+
+.toast {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  padding: 10px 18px;
+  border: 1px solid var(--success);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  color: var(--success);
+  font-size: 14px;
+  box-shadow: 0 4px 16px rgb(0 0 0 / 35%);
+}
+
+/* --- light theme -------------------------------------------------------- */
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #ffffff;
+    --surface: #f6f8fa;
+    --surface-raised: #eaeef2;
+    --border: #d0d7de;
+    --text: #1f2328;
+    --text-muted: #59636e;
+    --accent: #0f766e;
+    --accent-contrast: #ffffff;
+    --success: #1a7f37;
+    --danger: #cf222e;
+    --danger-surface: #fff0f0;
+  }
+
+  .toast {
+    box-shadow: 0 4px 16px rgb(31 35 40 / 18%);
+  }
+}

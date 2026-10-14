@@ -15,6 +15,7 @@ demo can be performed from a fresh `redis-cli` connection.
 | 7 | AOF persistence | **Done** | Append-only log of writes, replayed on startup | Kill server with SIGKILL, restart, writes survive |
 | 8 | Benchmarking | **Done** | Measured PING/SET/GET throughput vs. Redis baseline | A short report in `docs/BENCHMARKS.md` |
 | 9 | KEYS command | Done | Returns all non-expired keys; only * supported | `redis-cli KEYS *` lists the keyspace |
+| 10 | Web UI | Done | Verdigris-admin UI served by cmd/verdigris-ui | Open http://127.0.0.1:8080 |
 
 Milestone 1's original demo was `nc localhost 6379`. Windows ships no `nc`,
 so the demo is any raw TCP client instead — see the README's Running section
