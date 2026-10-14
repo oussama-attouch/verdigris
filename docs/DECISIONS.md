@@ -3,6 +3,49 @@
 Every non-obvious choice gets an entry. Format: date · decision · context ·
 alternatives · reason.
 
+## 2026-10-14 — Benchmark harness is a Go RESP client
+
+Context: M8 needs honest numbers for Verdigris and Redis. Two options:
+shell out to redis-benchmark, or write a client in Go. redis-benchmark
+would measure the two servers asymmetrically (it is compiled against
+Redis's own client library) and would not exercise Verdigris's encoder.
+
+Decision: a Go program at cmd/vg-bench that speaks RESP over TCP using
+internal/protocol for encode and decode. Same binary, same flags, same
+workload, both servers. The harness is a client — it does not import
+internal/store or internal/server.
+
+Reason: fairness. The only variable between runs is which server is at
+the other end of the socket. The protocol package is exercised in both
+directions, so its performance is included in the measurement rather
+than hidden.
+
+## 2026-10-14 — Latency percentiles are quantized by the system clock
+
+Context: vg-bench reports p50/p95/p99 from one time.Now reading per
+operation. On the Windows machine this was developed on, time.Now
+advances in steps of about 0.5ms — measured, not assumed: 199,995 of
+200,000 back-to-back readings differ by 0ns, a 1ms sleep reports as
+1.5ms, and a 100us busy-wait reports as 339us.
+
+Decision: keep the per-operation percentiles, and report mean latency
+alongside them, derived from the run's total elapsed time divided by
+operations rather than from the per-operation durations.
+
+Reason: a loopback round trip of tens of microseconds falls inside one
+tick, so it is recorded as exactly 0 and p50 prints as 0.000ms. That
+number is not a measurement of the server; it is a measurement of the
+clock. The error cannot be fixed portably — stdlib-only Go has no
+cross-platform high-resolution timer — but it can be amortized: total
+elapsed time spans thousands of ticks, so the mean stays accurate to a
+fraction of a microsecond on any run of real length. Throughput is
+unaffected for the same reason. The percentiles are still reported
+because they are exact on a fine-grained clock, and because their upper
+tail is real information; the mean is what to trust when the two
+disagree. This is documented for the reader in cmd/vg-bench/doc.go,
+because a bare "p50=0.000ms" in a benchmark report reads as a broken
+timer rather than as a fast server.
+
 ## 2026-10-14 — AOF file format is RESP
 
 Context: Redis's AOF is a sequence of RESP-encoded commands. An
