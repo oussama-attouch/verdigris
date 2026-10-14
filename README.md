@@ -147,6 +147,43 @@ connections, drains them, flushes the log, writes the snapshot, and exits 0.
 print usage and exit 2. A corrupt log or snapshot exits 1 before the listener
 opens.
 
+## Web UI
+
+`cmd/verdigris-ui` is a small web interface for browsing and editing the
+keyspace. It is a **separate process** from the server: it speaks RESP to
+Verdigris exactly as `redis-cli` does, so it has no private access to the store
+and can be stopped or restarted without touching the server. Start the server
+first, then the UI:
+
+```bash
+go run ./cmd/verdigris                              # the server, on :6379
+go run ./cmd/verdigris-ui                           # the UI, on :8080
+go run ./cmd/verdigris-ui -verdigris 127.0.0.1:6379 -http 127.0.0.1:8080 -web ./web
+```
+
+The UI needs two processes running, which is the price of keeping Verdigris a
+pure RESP server. It comes up even when Verdigris is down — `/api/health`
+reports `{"verdigris":"down"}` and the client reconnects on the first command
+that succeeds, so a UI started first will pick up a server that appears later.
+
+The JSON API behind the page:
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/health` | Is Verdigris answering? |
+| GET | `/api/keys` | `KEYS *` |
+| GET | `/api/dump` | Every key with its value and TTL, in one request |
+| GET | `/api/get?key=` | Read one key |
+| POST | `/api/set` | `{"key","value","ttl"}` — `ttl` optional |
+| DELETE | `/api/del?key=` | Delete one key |
+| POST | `/api/expire` | `{"key","ttl"}` |
+| GET | `/api/ttl?key=` | Remaining time; `-1` no expiry, `-2` missing |
+| POST | `/api/save` | Write a snapshot |
+
+Every response is JSON, errors included: `400` when the request was malformed,
+`502` when Verdigris is unreachable or answers with an error frame. Static files
+come from `-web` (default `./web`).
+
 ## Benchmarks
 
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) holds the full matrix — three

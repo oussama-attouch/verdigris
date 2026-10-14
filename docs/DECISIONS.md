@@ -3,6 +3,21 @@
 Every non-obvious choice gets an entry. Format: date · decision · context ·
 alternatives · reason.
 
+## 2026-10-14 — Web UI is a separate process
+
+Context: The UI could live inside the Verdigris binary (an HTTP listener
+alongside the RESP listener) or as a separate process.
+
+Decision: separate. `cmd/verdigris-ui` is its own binary. It dials
+Verdigris over RESP like any other client.
+
+Reason: Verdigris stays a pure RESP server. The UI can be killed,
+restarted, or upgraded without touching the server. The UI talks to the
+same protocol a redis-cli user does, so any bug in the UI cannot corrupt
+the store through a private path — it can only send commands a client
+could send. The cost is a second process to start; a README note covers
+that.
+
 ## 2026-10-14 — KEYS accepts only `*` for now
 
 Context: Redis's KEYS supports glob patterns (`user:*`, `?`, `[abc]`).
