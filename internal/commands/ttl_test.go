@@ -66,14 +66,44 @@ func TestTTLWithLiveTTLReturnsPositive(t *testing.T) {
 // TestTTLRoundTripNeverContradictsLiveness is the invariant that matters more
 // than exact rounding at the sub-second boundary.
 //
-// For every TTL a key can have, the integer TTL reports must agree with the
-// key's existence: a live key must never read as 0 or negative, and a dead one
-// must never read as positive. A client that uses `TTL k > 0` as a liveness
-// check — which is idiomatic Redis — depends on exactly this.
+// For every TTL a key can have, the integer TTL reports must be one a client
+// can trust: a live key must never read as 0 or negative, and a key that is
+// already gone must report the missing sentinel. A client that uses
+// `TTL k > 0` as a liveness check — which is idiomatic Redis — depends on
+// exactly this.
 //
 // It is what caught the sub-half-second case: with plain rounding, a key set
 // with PX 500 reads as 0 a few hundred microseconds later, because 499.9 ms
 // rounds down. Zero is a lie about a key that is still readable.
+//
+// # Why this asserts a set of values and not a relation between two samples
+//
+// The obvious version of this test asks TTL for a value, asks the store
+// whether the key still exists, and asserts the two agree. That version is
+// wrong, and it failed roughly once in a hundred runs for four milestones.
+//
+// The two questions are separate observations, each reading the clock, so they
+// describe two different instants — not one. With a 1ns TTL the key is
+// guaranteed to die in between; whether the failure shows up is only a question
+// of whether the goroutine is preempted inside that window. The false alarm
+// reads: the handler sees a live key with sub-nanosecond remaining and
+// correctly reports the floor of 1, the key then expires, and the existence
+// check reports it gone. Both answers are truthful. There is no instant at
+// which they conflict, because they were never taken at the same instant.
+//
+// No reordering fixes that: sampling liveness first just moves the race to the
+// other side, where a key that died in the gap makes a live reading pair with
+// the missing sentinel. The honest assertion is therefore about the TTL value
+// alone, in the terms the implementation guarantees it:
+//
+//	live key with an expiry -> at least 1
+//	key already gone        -> exactly -2
+//
+// Because the TTL question is asked first, a positive answer says the key was
+// alive at that moment and deliberately says nothing about now — it may have
+// died since, which is ordinary. Every other value is impossible whenever it
+// is observed, so the half-second rounding bug this test exists for still
+// fails it, and so does a wrong or newly invented sentinel.
 func TestTTLRoundTripNeverContradictsLiveness(t *testing.T) {
 	ttls := []time.Duration{
 		time.Nanosecond,
@@ -105,12 +135,27 @@ func TestTTLRoundTripNeverContradictsLiveness(t *testing.T) {
 				t.Fatalf("TTL = %#v (%T), want protocol.Integer", got, got)
 			}
 
+			// Corroboration, not a second sample to compare against. If the
+			// key is still here, it was here when TTL was asked, so a missing
+			// sentinel would be a contradiction and is rejected below.
 			live := s.Exists([]byte("k"))
+
 			switch {
-			case live && n < 1:
-				t.Fatalf("key is live with %v left but TTL reported %d; a live key must read as at least 1", ttl, n)
-			case !live && n >= 0:
-				t.Fatalf("key is gone but TTL reported %d", n)
+			case live && n == -2:
+				t.Fatal("key is still live but TTL reported -2 (missing); the sentinel cannot be true")
+			case n >= 1:
+				// Alive when asked. Whether it is alive now is not this
+				// assertion's business: the TTL may simply have elapsed since,
+				// and treating that as a failure is the bug this test used to
+				// have. A live key reports at least 1 by construction, so this
+				// is also where a sub-half-second rounding regression lands.
+			case n == -2:
+				// Already gone when asked. Correct, and the only way a
+				// vanished key may be reported. -1 cannot appear here: the
+				// store returns it only for a key with no expiry set, which
+				// this test never creates.
+			default:
+				t.Fatalf("TTL of a key set with %v = %d, want >= 1 for a live key or -2 for a missing one; 0, -1 and values below -2 are never valid here", ttl, n)
 			}
 		})
 	}
