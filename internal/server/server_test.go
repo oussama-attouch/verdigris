@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2355,4 +2356,78 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestKeysOverTCP checks KEYS end to end: the reply is an array of the keys
+// that were written, and an empty array once they are gone. It runs the two
+// halves on separate connections, which is the property that makes KEYS useful
+// for a UI — the keyspace is shared, so a key set by one client is listed by
+// another.
+//
+// The reply is compared as a sorted set rather than as a sequence, because the
+// store documents the order as unspecified. Asserting an order here would pin
+// the map's iteration order, which is deliberately not a contract and would
+// make the test fail intermittently for no real reason.
+func TestKeysOverTCP(t *testing.T) {
+	discardLogs(t)
+	ts := startTestServer(t)
+
+	writer := ts.client(t)
+	for key, value := range map[string]string{"alpha": "one", "beta": "two", "gamma": "three"} {
+		writer.send(commandFrame("SET", key, value))
+		writer.expect(protocol.SimpleString("OK"))
+	}
+
+	reader := ts.client(t)
+	reader.send(commandFrame("KEYS", "*"))
+
+	got := reader.next()
+	arr, ok := got.(protocol.Array)
+	if !ok {
+		t.Fatalf("KEYS * = %#v (%T), want protocol.Array", got, got)
+	}
+
+	keys := make([]string, 0, len(arr))
+	for i, elem := range arr {
+		bulk, ok := elem.(protocol.BulkString)
+		if !ok {
+			t.Fatalf("element %d is %T (%#v), want protocol.BulkString", i, elem, elem)
+		}
+		keys = append(keys, string(bulk))
+	}
+	sort.Strings(keys)
+
+	want := []string{"alpha", "beta", "gamma"}
+	if len(keys) != len(want) {
+		t.Fatalf("KEYS * = %q, want %q", keys, want)
+	}
+	for i := range want {
+		if keys[i] != want[i] {
+			t.Fatalf("KEYS * = %q, want %q", keys, want)
+		}
+	}
+
+	// An empty keyspace must answer with an empty array, not a null, and this
+	// is the wire bytes a client actually sees.
+	empty := ts.client(t)
+	empty.send(commandFrame("DEL", "alpha", "beta", "gamma"))
+	empty.expect(protocol.Integer(3))
+
+	empty.send(commandFrame("KEYS", "*"))
+	after := empty.next()
+	afterArr, ok := after.(protocol.Array)
+	if !ok {
+		t.Fatalf("KEYS * on an empty keyspace = %#v (%T), want protocol.Array", after, after)
+	}
+	if len(afterArr) != 0 {
+		t.Fatalf("KEYS * after deleting everything = %#v, want an empty array", after)
+	}
+	if encoded := string(protocol.Encode(after)); encoded != "*0\r\n" {
+		t.Fatalf("empty KEYS reply encoded as %q, want %q", encoded, "*0\r\n")
+	}
+
+	// A pattern other than * is refused over the wire too, so the restriction
+	// is the server's behavior and not only the handler's.
+	reader.send(commandFrame("KEYS", "user:*"))
+	reader.expect(protocol.Error("ERR KEYS: only * is supported"))
 }

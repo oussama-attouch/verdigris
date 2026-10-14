@@ -45,6 +45,10 @@
 // TTL of zero is expired at the instant it is written rather than a tick
 // later.
 //
+// Keys follows the same rule as Snapshot: the clock is read exactly once per
+// call and every entry is filtered against that single instant, so the answer
+// describes one moment rather than a window that shifts as the loop runs.
+//
 // # Two deletion paths
 //
 // An expired key is removed in two ways, and both are needed.

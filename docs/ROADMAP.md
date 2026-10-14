@@ -14,6 +14,7 @@ demo can be performed from a fresh `redis-cli` connection.
 | 6 | RDB persistence | **Done** | Point-in-time snapshot on shutdown, load on startup | Restart server, data survives |
 | 7 | AOF persistence | **Done** | Append-only log of writes, replayed on startup | Kill server with SIGKILL, restart, writes survive |
 | 8 | Benchmarking | **Done** | Measured PING/SET/GET throughput vs. Redis baseline | A short report in `docs/BENCHMARKS.md` |
+| 9 | KEYS command | Done | Returns all non-expired keys; only * supported | `redis-cli KEYS *` lists the keyspace |
 
 Milestone 1's original demo was `nc localhost 6379`. Windows ships no `nc`,
 so the demo is any raw TCP client instead — see the README's Running section

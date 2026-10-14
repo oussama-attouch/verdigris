@@ -315,6 +315,65 @@ func (s *Store) Count() int {
 	return live
 }
 
+// Keys returns every non-expired key in the store. Order is unspecified.
+// The clock is read exactly once; all entries are filtered against that
+// single instant. The returned slice contains copies of the key bytes;
+// the caller may mutate it.
+//
+// The live set is decided by one clock reading, not one per key, so the answer
+// describes a single moment — the same rule Snapshot follows. Reading the clock
+// inside the loop would let two keys whose deadlines differ by a nanosecond be
+// decided by the order the map happened to yield them.
+//
+// Expired keys are skipped, not deleted. Removing them would need the write
+// lock, and this is a read command: passive deletion already removes an expired
+// key the next time anything looks at it, and the sweeper collects the rest. A
+// KEYS call is therefore allowed to observe keys that are still in the map but
+// past their deadline — it just does not report them.
+//
+// The map is held under a read lock only long enough to collect the key strings.
+// Filtering and copying happen after it is released, so a slow client receiving
+// a large reply cannot hold the keyspace against writers for the length of the
+// copy.
+func (s *Store) Keys() [][]byte {
+	now := s.clk.Now()
+
+	// Collect the names first, then release. The strings are immutable, so
+	// they stay valid after the lock is dropped even if the map changes
+	// underneath; the entry lookup below re-checks each one.
+	s.mu.RLock()
+	names := make([]string, 0, len(s.data))
+	for k := range s.data {
+		names = append(names, k)
+	}
+	s.mu.RUnlock()
+
+	keys := make([][]byte, 0, len(names))
+
+	// A second read lock covers the whole filtering pass rather than one
+	// acquisition per key. Taking it per key would mean releasing and
+	// re-acquiring N times, and the map cannot change in a way that matters
+	// here: a key deleted between the collection and this pass is simply
+	// gone from the map, and the lookup below notices.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, name := range names {
+		e, stillThere := s.data[name]
+		if !stillThere || e.expired(now) {
+			continue
+		}
+		// []byte(name) allocates a fresh slice, so the caller owns bytes that
+		// are not aliased by the map. Handing back a string's backing array
+		// is not possible, but handing back a slice that shares storage with
+		// anything the store keeps would break the package's central
+		// invariant that the store owns its memory.
+		keys = append(keys, []byte(name))
+	}
+
+	return keys
+}
+
 // Snapshot returns every live entry in the store as of the store's current
 // clock time. Expired entries are omitted. The order is unspecified.
 //

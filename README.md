@@ -4,12 +4,12 @@ A Redis-compatible key-value store, written from scratch in Go.
 
 ## Status
 
-Milestones 1–7 complete. The server is a working string store with key
+Milestones 1–9 complete. The server is a working string store with key
 expiration and two persistence mechanisms: `SET`, `GET`, `DEL`, `EXISTS`,
-`EXPIRE`, `TTL`, `PERSIST` and `SAVE` operate on a keyspace shared by every
-connection, with `SET ... EX/PX` for time-limited writes. Expired keys are
-removed both on access and by a background sweeper, and every TTL test runs on
-an injected clock rather than sleeping.
+`EXPIRE`, `TTL`, `PERSIST`, `KEYS` and `SAVE` operate on a keyspace shared by
+every connection, with `SET ... EX/PX` for time-limited writes. Expired keys
+are removed both on access and by a background sweeper, and every TTL test runs
+on an injected clock rather than sleeping.
 
 Persistence is an append-only log, a point-in-time snapshot, or both. With
 `-aof-path` every write command is appended to a RESP-encoded log and replayed
@@ -104,6 +104,8 @@ redis-cli GET foo                    # "bar"
 redis-cli EXISTS foo                 # (integer) 1
 redis-cli DEL foo                    # (integer) 1
 redis-cli GET foo                    # (nil)
+redis-cli KEYS *                     # every key, e.g. "session"
+redis-cli KEYS user:*                # (error) ERR KEYS: only * is supported
 redis-cli SET session abc EX 5       # expires in five seconds
 redis-cli TTL session                # (integer) 5, then counts down
 redis-cli SAVE                       # OK

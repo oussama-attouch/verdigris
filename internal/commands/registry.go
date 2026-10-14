@@ -193,7 +193,7 @@ func (r *Registry) Names() []string {
 // state that is already correct and, worse, would make the log's meaning
 // depend on when a snapshot happened. It is registered as a read — meaning
 // "not logged", not "cannot write" — and the RDB stays the manual-snapshot
-// mechanism. TTL is a query and is a read.
+// mechanism. TTL and KEYS are queries and are reads.
 func DefaultRegistry(s *store.Store, save SaveFunc) *Registry {
 	r := NewRegistry()
 	r.Register("PING", Ping)
@@ -201,6 +201,7 @@ func DefaultRegistry(s *store.Store, save SaveFunc) *Registry {
 	r.Register("GET", GetHandler(s))
 	r.Register("EXISTS", ExistsHandler(s))
 	r.Register("TTL", TTLHandler(s))
+	r.Register("KEYS", KeysHandler(s))
 	r.Register("CLIENT", ClientHandler())
 	r.Register("COMMAND", CommandHandler())
 

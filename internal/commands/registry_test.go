@@ -275,7 +275,7 @@ func TestNames(t *testing.T) {
 	r := DefaultRegistry(store.New(store.RealClock{}), nil)
 
 	got := r.Names()
-	want := []string{"CLIENT", "COMMAND", "DEL", "ECHO", "EXISTS", "EXPIRE", "GET", "PERSIST", "PING", "SAVE", "SET", "TTL"}
+	want := []string{"CLIENT", "COMMAND", "DEL", "ECHO", "EXISTS", "EXPIRE", "GET", "KEYS", "PERSIST", "PING", "SAVE", "SET", "TTL"}
 
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Names() = %v, want %v", got, want)
@@ -333,7 +333,7 @@ func TestRegisterDuplicatePanics(t *testing.T) {
 func TestDefaultRegistryHasTheBuiltins(t *testing.T) {
 	r := DefaultRegistry(store.New(store.RealClock{}), nil)
 
-	for _, name := range []string{"PING", "ECHO", "SET", "GET", "DEL", "EXISTS", "EXPIRE", "TTL", "PERSIST", "SAVE", "CLIENT", "COMMAND"} {
+	for _, name := range []string{"PING", "ECHO", "SET", "GET", "DEL", "EXISTS", "EXPIRE", "TTL", "PERSIST", "KEYS", "SAVE", "CLIENT", "COMMAND"} {
 		got, fault := r.Dispatch(protocol.Array{
 			protocol.BulkString([]byte(name)),
 			protocol.BulkString([]byte("a")),
@@ -352,7 +352,7 @@ func TestDefaultRegistryHasTheBuiltins(t *testing.T) {
 		}
 	}
 
-	want := []string{"CLIENT", "COMMAND", "DEL", "ECHO", "EXISTS", "EXPIRE", "GET", "PERSIST", "PING", "SAVE", "SET", "TTL"}
+	want := []string{"CLIENT", "COMMAND", "DEL", "ECHO", "EXISTS", "EXPIRE", "GET", "KEYS", "PERSIST", "PING", "SAVE", "SET", "TTL"}
 	if names := r.Names(); !reflect.DeepEqual(names, want) {
 		t.Fatalf("DefaultRegistry names = %v, want %v", names, want)
 	}

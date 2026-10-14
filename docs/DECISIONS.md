@@ -3,6 +3,22 @@
 Every non-obvious choice gets an entry. Format: date · decision · context ·
 alternatives · reason.
 
+## 2026-10-14 — KEYS accepts only `*` for now
+
+Context: Redis's KEYS supports glob patterns (`user:*`, `?`, `[abc]`).
+Implementing glob requires a matcher with the same edge cases as fnmatch
+and adds a test surface that duplicates the pattern language. The web UI
+that motivated KEYS needs only "list every key".
+
+Decision: accept `*` and nothing else. Any other argument returns
+`ERR KEYS: only * is supported`. SCAN with MATCH and COUNT is the proper
+Redis answer for large keyspaces and is deferred; KEYS * is documented
+as blocking, matching Redis's own semantics for the same command.
+
+Reason: an honest subset now, tested, beats a partial glob that silently
+misses `[` or mishandles `\\` escapes. The error message tells a client
+exactly what it can ask for.
+
 ## 2026-10-14 — Benchmark harness is a Go RESP client
 
 Context: M8 needs honest numbers for Verdigris and Redis. Two options:
