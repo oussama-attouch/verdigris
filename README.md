@@ -2,6 +2,58 @@
 
 A Redis-compatible key-value store, written from scratch in Go.
 
+<img src="docs/screenshots/ui.png" alt="Verdigris Web UI" width="720">
+
+Verdigris speaks RESP over TCP well enough that `redis-cli` and any other Redis
+client work against it unchanged, and it keeps that keyspace across a restart
+with a point-in-time snapshot, an append-only log, or both. It is built from the
+standard library alone — its own protocol codec, its own store, its own file
+formats — so the whole engine is readable in an afternoon. The screenshot above
+is the admin UI (`cmd/verdigris-ui`) talking to the server as an ordinary RESP
+client, the same way `redis-cli` does.
+
+## Quick start
+
+```bash
+go run ./cmd/verdigris        # the server, listening on :6379
+go run ./cmd/verdigris-ui     # the admin UI, on :8080
+```
+
+Then open <http://127.0.0.1:8080> — or skip the UI and use `redis-cli`.
+
+## A real session
+
+Protocol compatibility is the whole claim, so here it is rather than a
+description of it. This is a `redis-cli` session against Verdigris, pasted
+verbatim from the run that produced the screenshot above:
+
+```console
+$ redis-cli -p 6379 PING
+PONG
+$ redis-cli -p 6379 SET user:1 alice
+OK
+$ redis-cli -p 6379 GET user:1
+alice
+$ redis-cli -p 6379 EXISTS user:1
+1
+$ redis-cli -p 6379 SET session:abc "token-value" EX 300
+OK
+$ redis-cli -p 6379 TTL session:abc
+300
+$ redis-cli -p 6379 KEYS *
+user:1
+session:abc
+$ redis-cli -p 6379 DEL user:1
+1
+$ redis-cli -p 6379 EXISTS user:1
+0
+$ redis-cli -p 6379 SAVE
+OK
+```
+
+Nothing above is Verdigris-specific: no new commands, no changed replies, no
+extra flags. A client that works against Redis works here.
+
 ## Status
 
 Milestones 1–9 complete. The server is a working string store with key
