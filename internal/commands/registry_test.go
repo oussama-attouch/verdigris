@@ -403,3 +403,93 @@ func TestDispatchIsSafeForConcurrentUse(t *testing.T) {
 		<-done
 	}
 }
+
+// TestRegisterWriteMarksAndRegisterDoesNot is the distinction the AOF rests on:
+// a write command must be identifiable so the server can log it, and a read
+// command must not be, so the log stays a record of changes rather than of
+// traffic.
+func TestRegisterWriteMarksAndRegisterDoesNot(t *testing.T) {
+	r := NewRegistry()
+	noop := func([]protocol.Value) (protocol.Value, error) { return protocol.SimpleString("OK"), nil }
+
+	r.Register("READS", noop)
+	r.RegisterWrite("WRITES", noop)
+
+	if !r.IsWrite("WRITES") {
+		t.Error("IsWrite(WRITES) = false after RegisterWrite, want true")
+	}
+	if r.IsWrite("READS") {
+		t.Error("IsWrite(READS) = true after Register, want false")
+	}
+}
+
+// TestIsWriteIsCaseInsensitive matters because the server calls it with the
+// command name exactly as the client sent it — redis-cli sends lower case —
+// while RegisterWrite stores the uppercased form. A case-sensitive lookup
+// would silently stop logging every command from a normal client.
+func TestIsWriteIsCaseInsensitive(t *testing.T) {
+	r := NewRegistry()
+	r.RegisterWrite("SET", func([]protocol.Value) (protocol.Value, error) {
+		return protocol.SimpleString("OK"), nil
+	})
+
+	for _, name := range []string{"SET", "set", "Set", "sEt"} {
+		if !r.IsWrite(name) {
+			t.Errorf("IsWrite(%q) = false, want true: the lookup must be case-insensitive", name)
+		}
+	}
+	if r.IsWrite("SETX") {
+		t.Error("IsWrite(SETX) = true, want false; a prefix of a registered name is not registered")
+	}
+}
+
+// TestIsWriteOnUnknownCommand pins the safe default. An unregistered name is
+// not a write, so a command nobody classified is never logged — under-logging
+// loses one command after a restart, while over-logging replays operations
+// that never happened.
+func TestIsWriteOnUnknownCommand(t *testing.T) {
+	r := NewRegistry()
+
+	if r.IsWrite("NOPE") {
+		t.Error("IsWrite on an empty registry = true, want false")
+	}
+
+	r.Register("PING", Ping)
+	if r.IsWrite("PING") {
+		t.Error("IsWrite(PING) = true for a registry that never called RegisterWrite")
+	}
+}
+
+// TestDefaultRegistryClassifiesWrites pins the classification itself. It is a
+// literal list rather than a property, because the point is to catch a command
+// being added to DefaultRegistry without a decision about whether it belongs
+// in the log — the failure would otherwise be a write that silently stops
+// surviving a restart.
+func TestDefaultRegistryClassifiesWrites(t *testing.T) {
+	r := DefaultRegistry(store.New(store.RealClock{}), nil)
+
+	writes := []string{"SET", "DEL", "EXPIRE", "PERSIST"}
+	for _, name := range writes {
+		if !r.IsWrite(name) {
+			t.Errorf("IsWrite(%s) = false, want true: %s changes the keyspace", name, name)
+		}
+	}
+
+	// SAVE is the deliberate omission. It writes a file, but it does not
+	// change the keyspace, so logging it would make the log's meaning depend
+	// on when a snapshot happened. TTL is a query.
+	reads := []string{"PING", "ECHO", "GET", "EXISTS", "TTL", "CLIENT", "COMMAND", "SAVE"}
+	for _, name := range reads {
+		if r.IsWrite(name) {
+			t.Errorf("IsWrite(%s) = true, want false: %s does not change the keyspace", name, name)
+		}
+	}
+
+	// Every write must also be dispatchable. A name marked as a write but
+	// never registered would be logged by the server and then fail to replay.
+	for _, name := range writes {
+		if _, fault := r.Dispatch(protocol.Array{protocol.BulkString([]byte(name))}); fault != nil {
+			t.Errorf("Dispatch(%s) reported a fault: %v", name, fault)
+		}
+	}
+}

@@ -18,22 +18,60 @@ var ErrUnknownCommand = errors.New("unknown command")
 // Registry maps command names to handlers. Names are case-insensitive on
 // lookup, matching Redis's behavior.
 type Registry struct {
-	// mu guards handlers. The server dispatches from one goroutine per
-	// connection, so several goroutines read the map concurrently. Reads
-	// vastly outnumber writes — registration happens at startup — which is
-	// what makes an RWMutex the right choice over a plain Mutex.
+	// mu guards handlers and writes. The server dispatches from one
+	// goroutine per connection, so several goroutines read the maps
+	// concurrently. Reads vastly outnumber writes — registration happens at
+	// startup — which is what makes an RWMutex the right choice over a plain
+	// Mutex.
 	mu       sync.RWMutex
 	handlers map[string]Handler
+
+	// writes marks the names registered as write commands. It is a parallel
+	// map rather than an isWrite field beside each handler because the two
+	// are written together and only ever read together: a name is in writes
+	// exactly when RegisterWrite put it there, and the single mutex above
+	// covers both maps. A struct-valued map would work too, but it changes
+	// what lookup returns for every existing caller to carry one bit that
+	// only the AOF path reads.
+	//
+	// A name absent from this map is a read. That is the safe default: an
+	// unregistered or forgotten command is not logged, and the failure mode
+	// of under-logging is a command missing after a restart, while the
+	// failure mode of over-logging is a log full of reads that replay into
+	// operations nobody performed.
+	writes map[string]bool
 }
 
 // NewRegistry returns an empty Registry with no commands registered.
 func NewRegistry() *Registry {
-	return &Registry{handlers: make(map[string]Handler)}
+	return &Registry{
+		handlers: make(map[string]Handler),
+		writes:   make(map[string]bool),
+	}
 }
 
-// Register adds a handler under name. Names are uppercased internally.
+// Register adds a read-only handler under name. Names are uppercased.
 // A duplicate registration panics, because it can only happen at init time.
 func (r *Registry) Register(name string, h Handler) {
+	r.register(name, h, false)
+}
+
+// RegisterWrite adds a write handler. Write commands are logged to the
+// AOF when one is enabled.
+//
+// "Write" here means "changes the keyspace", which is what makes a command
+// worth replaying after a crash. It is not a statement about whether the
+// command is logged by Redis, and it does not include commands whose only
+// effect is on the connection — CLIENT SETINFO changes a client's name, not
+// a key, so replaying it would be meaningless.
+func (r *Registry) RegisterWrite(name string, h Handler) {
+	r.register(name, h, true)
+}
+
+// register is the shared body of Register and RegisterWrite. The two differ
+// only in the flag they store, and duplicating the duplicate-name check
+// between them would mean two places to keep in step.
+func (r *Registry) register(name string, h Handler, isWrite bool) {
 	upper := strings.ToUpper(name)
 
 	r.mu.Lock()
@@ -44,10 +82,29 @@ func (r *Registry) Register(name string, h Handler) {
 		// recovery: one of the two handlers would silently shadow the other,
 		// and which one wins would depend on init order. Failing loudly at
 		// startup is far better than a command that quietly does the wrong
-		// thing later.
+		// thing later. The check is against handlers, not writes, so
+		// registering the same name once as a read and once as a write is
+		// caught here too.
 		panic(fmt.Sprintf("commands: duplicate registration of %q", upper))
 	}
 	r.handlers[upper] = h
+
+	if isWrite {
+		r.writes[upper] = true
+	}
+}
+
+// IsWrite reports whether name was registered as a write command.
+// Case-insensitive.
+//
+// The lookup is by the same uppercasing Register applies, so a caller can
+// pass the command name exactly as it arrived from a client without
+// normalizing it first.
+func (r *Registry) IsWrite(name string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.writes[strings.ToUpper(name)]
 }
 
 // Dispatch takes a decoded RESP value and routes it to a handler.
@@ -128,19 +185,29 @@ func (r *Registry) Names() []string {
 // always passes a real one, and the server registers its own Save immediately
 // after construction so that no reachable moment exists where SAVE is absent
 // or broken.
+//
+// The split between Register and RegisterWrite is what the AOF uses to decide
+// what to log. SET, DEL, EXPIRE and PERSIST change the keyspace and are
+// writes. SAVE is the interesting case: it writes a file, but it does not
+// change the keyspace, so replaying it against a log would re-snapshot a
+// state that is already correct and, worse, would make the log's meaning
+// depend on when a snapshot happened. It is registered as a read — meaning
+// "not logged", not "cannot write" — and the RDB stays the manual-snapshot
+// mechanism. TTL is a query and is a read.
 func DefaultRegistry(s *store.Store, save SaveFunc) *Registry {
 	r := NewRegistry()
 	r.Register("PING", Ping)
 	r.Register("ECHO", Echo)
-	r.Register("SET", SetHandler(s))
 	r.Register("GET", GetHandler(s))
-	r.Register("DEL", DelHandler(s))
 	r.Register("EXISTS", ExistsHandler(s))
-	r.Register("EXPIRE", ExpireHandler(s))
 	r.Register("TTL", TTLHandler(s))
-	r.Register("PERSIST", PersistHandler(s))
 	r.Register("CLIENT", ClientHandler())
 	r.Register("COMMAND", CommandHandler())
+
+	r.RegisterWrite("SET", SetHandler(s))
+	r.RegisterWrite("DEL", DelHandler(s))
+	r.RegisterWrite("EXPIRE", ExpireHandler(s))
+	r.RegisterWrite("PERSIST", PersistHandler(s))
 
 	if save == nil {
 		// The handler still exists, so PING and every other command behave

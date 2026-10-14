@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Oussama-Att/verdigris/internal/aof"
 	"github.com/Oussama-Att/verdigris/internal/commands"
 	"github.com/Oussama-Att/verdigris/internal/protocol"
 	"github.com/Oussama-Att/verdigris/internal/rdb"
@@ -601,6 +602,58 @@ func startServer(t *testing.T) (addr string, shutdown func()) {
 
 	ts := startTestServer(t)
 	return ts.addr, ts.shutdown
+}
+
+// newTestServerWithAOF builds a Server with an append-only log at aofPath and
+// no snapshot, which is the configuration the AOF tests exercise.
+//
+// New can fail here — a corrupt log must stop construction — so this helper is
+// for the tests that expect success. Tests that assert a startup failure call
+// NewWithAOF directly.
+func newTestServerWithAOF(t *testing.T, aofPath string) *Server {
+	t.Helper()
+
+	srv, err := NewWithAOF("127.0.0.1:0", store.RealClock{}, testSweepInterval, "", aofPath, aof.FsyncAlways)
+	if err != nil {
+		t.Fatalf("NewWithAOF(aofPath=%q): %v", aofPath, err)
+	}
+	return srv
+}
+
+// startServerWithAOF serves a server with an append-only log and returns the
+// running handle.
+func startServerWithAOF(t *testing.T, aofPath string) *testServer {
+	t.Helper()
+
+	return serveTestServer(t, newTestServerWithAOF(t, aofPath))
+}
+
+// replayAOF reads a log from disk through the same reader the server uses at
+// startup, so an assertion about its contents is an assertion about what a
+// restart would actually apply rather than about raw bytes.
+func replayAOF(t *testing.T, path string) [][]protocol.Value {
+	t.Helper()
+
+	cmds, err := aof.Replay(path)
+	if err != nil {
+		t.Fatalf("aof.Replay(%s): %v", path, err)
+	}
+	return cmds
+}
+
+// argsOf renders a replayed command as strings for comparison.
+func argsOf(t *testing.T, cmd []protocol.Value) []string {
+	t.Helper()
+
+	out := make([]string, len(cmd))
+	for i, v := range cmd {
+		bulk, ok := v.(protocol.BulkString)
+		if !ok {
+			t.Fatalf("argument %d is %T, want protocol.BulkString", i, v)
+		}
+		out[i] = string(bulk)
+	}
+	return out
 }
 
 // --- Task 6: the required integration tests ---------------------------------
@@ -1999,4 +2052,307 @@ func expireFrame(command, key string, seconds int64) []byte {
 		protocol.BulkString([]byte(key)),
 		protocol.BulkString([]byte(strconv.FormatInt(seconds, 10))),
 	})
+}
+
+// TestAOFReplayOnStartup is the property the whole milestone exists for: a
+// clean shutdown followed by a restart must bring the keyspace back. It goes
+// through a real socket and a real file rather than the store, because the
+// failure it guards against — the log being written but never read, or read
+// after the handle is opened — lives in the wiring, not in either piece.
+func TestAOFReplayOnStartup(t *testing.T) {
+	discardLogs(t)
+	path := filepath.Join(t.TempDir(), "appendonly.aof")
+
+	// First run: write three keys and shut down.
+	ts := startServerWithAOF(t, path)
+	c := ts.client(t)
+
+	c.send(commandFrame("SET", "one", "1"))
+	if got := c.next(); got != protocol.SimpleString("OK") {
+		t.Fatalf("SET one = %#v, want OK", got)
+	}
+	c.send(commandFrame("SET", "two", "2"))
+	if got := c.next(); got != protocol.SimpleString("OK") {
+		t.Fatalf("SET two = %#v, want OK", got)
+	}
+	c.send(commandFrame("SET", "three", "3"))
+	if got := c.next(); got != protocol.SimpleString("OK") {
+		t.Fatalf("SET three = %#v, want OK", got)
+	}
+	ts.shutdown()
+
+	// Second run: the same log, a new server, no keys set this time.
+	restarted := startServerWithAOF(t, path)
+	rc := restarted.client(t)
+
+	for key, want := range map[string]string{"one": "1", "two": "2", "three": "3"} {
+		rc.send(commandFrame("GET", key))
+		got := rc.next()
+		bulk, ok := got.(protocol.BulkString)
+		if !ok {
+			t.Fatalf("GET %s = %#v (%T), want a bulk string", key, got, got)
+		}
+		if string(bulk) != want {
+			t.Fatalf("GET %s = %q, want %q after replay", key, bulk, want)
+		}
+	}
+}
+
+// TestAOFPreferredOverRDB pins the precedence rule when both mechanisms are
+// configured. The two files describe the same keyspace by different means, so
+// loading both would apply one on top of the other; the log wins because it
+// records individual commands and can represent states a snapshot never
+// captured.
+func TestAOFPreferredOverRDB(t *testing.T) {
+	discardLogs(t)
+	dir := t.TempDir()
+	rdbPath := filepath.Join(dir, "dump.rdb")
+	aofPath := filepath.Join(dir, "appendonly.aof")
+
+	// These two files are hand-written and deliberately disagree: each holds a
+	// key the other does not, so which one was loaded is observable.
+	if err := rdb.Write(rdbPath, []rdb.Entry{
+		{Key: []byte("rdb-key"), Value: []byte("from-rdb")},
+	}); err != nil {
+		t.Fatalf("rdb.Write: %v", err)
+	}
+
+	seed, err := aof.Open(aofPath, aof.FsyncAlways)
+	if err != nil {
+		t.Fatalf("aof.Open: %v", err)
+	}
+	if err := seed.Append([]protocol.Value{
+		protocol.BulkString("SET"),
+		protocol.BulkString("aof-key"),
+		protocol.BulkString("from-aof"),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	srv, err := NewWithAOF("127.0.0.1:0", store.RealClock{}, testSweepInterval, rdbPath, aofPath, aof.FsyncAlways)
+	if err != nil {
+		t.Fatalf("NewWithAOF: %v", err)
+	}
+	ts := serveTestServer(t, srv)
+	c := ts.client(t)
+
+	// The log's key is present...
+	c.send(commandFrame("GET", "aof-key"))
+	got := c.next()
+	if bulk, ok := got.(protocol.BulkString); !ok || string(bulk) != "from-aof" {
+		t.Fatalf("GET aof-key = %#v, want \"from-aof\" from the replayed log", got)
+	}
+
+	// ...and the snapshot's key is not, which is what proves the snapshot was
+	// skipped rather than merged.
+	c.send(commandFrame("GET", "rdb-key"))
+	if got := c.next(); got != (protocol.Null{}) {
+		t.Fatalf("GET rdb-key = %#v, want null: the snapshot must not be loaded when a log is configured", got)
+	}
+}
+
+// TestAOFCorruptMidFileFailsStartup pins the fatal case. A log whose grammar is
+// broken in the middle cannot be partially trusted: the readable prefix is
+// real, but so is the damage, and a server that started from the prefix would
+// present a keyspace that never existed.
+func TestAOFCorruptMidFileFailsStartup(t *testing.T) {
+	discardLogs(t)
+	path := filepath.Join(t.TempDir(), "corrupt.aof")
+
+	var buf bytes.Buffer
+	buf.Write(protocol.Encode(protocol.Array{
+		protocol.BulkString("SET"), protocol.BulkString("a"), protocol.BulkString("1"),
+	}))
+	// 0xff is not a RESP marker, so the decoder reports a grammar violation
+	// rather than an incomplete frame — which is what makes it corruption
+	// rather than a torn tail.
+	buf.Write([]byte{0xff, 0xfe, 0xfd})
+	buf.Write(protocol.Encode(protocol.Array{
+		protocol.BulkString("SET"), protocol.BulkString("b"), protocol.BulkString("2"),
+	}))
+
+	if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	srv, err := NewWithAOF("127.0.0.1:0", store.RealClock{}, testSweepInterval, "", path, aof.FsyncAlways)
+	if err == nil {
+		srv.Close()
+		t.Fatal("NewWithAOF accepted a corrupt log, want an error")
+	}
+	if !errors.Is(err, aof.ErrCorrupt) {
+		t.Fatalf("NewWithAOF error = %v, want one wrapping aof.ErrCorrupt", err)
+	}
+}
+
+// TestAOFTruncatedTailIsRecovered is the crash case. A process killed mid-write
+// leaves a partial command at the end of the file, and that is ordinary rather
+// than corrupt: the server must start, apply everything before the tear, and
+// carry on appending at a frame boundary.
+func TestAOFTruncatedTailIsRecovered(t *testing.T) {
+	discardLogs(t)
+	path := filepath.Join(t.TempDir(), "truncated.aof")
+
+	var buf bytes.Buffer
+	buf.Write(protocol.Encode(protocol.Array{
+		protocol.BulkString("SET"), protocol.BulkString("kept"), protocol.BulkString("yes"),
+	}))
+	whole := buf.Len()
+	// Half of a second command: the shape a hard kill leaves behind.
+	torn := protocol.Encode(protocol.Array{
+		protocol.BulkString("SET"), protocol.BulkString("torn"), protocol.BulkString("no"),
+	})
+	buf.Write(torn[:len(torn)/2])
+
+	if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	srv, err := NewWithAOF("127.0.0.1:0", store.RealClock{}, testSweepInterval, "", path, aof.FsyncAlways)
+	if err != nil {
+		t.Fatalf("NewWithAOF on a truncated log: %v", err)
+	}
+	ts := serveTestServer(t, srv)
+	c := ts.client(t)
+
+	// The complete command before the tear is applied...
+	c.send(commandFrame("GET", "kept"))
+	got := c.next()
+	if bulk, ok := got.(protocol.BulkString); !ok || string(bulk) != "yes" {
+		t.Fatalf("GET kept = %#v, want \"yes\": commands before the tear must survive", got)
+	}
+
+	// ...and the torn one did not run.
+	c.send(commandFrame("GET", "torn"))
+	if got := c.next(); got != (protocol.Null{}) {
+		t.Fatalf("GET torn = %#v, want null: the partial command must not be applied", got)
+	}
+
+	// The file itself was rewritten to end at the last complete command, so
+	// the next append lands on a frame boundary rather than after debris.
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if len(onDisk) != whole {
+		t.Fatalf("log is %d bytes after replay, want %d (the one complete command)", len(onDisk), whole)
+	}
+
+	// A write after recovery must be replayable, which is the property the
+	// truncation exists to protect. The old connection is closed first so the
+	// server has no in-flight client while the new one is opened.
+	ts.closeConnections()
+	c2 := ts.client(t)
+	c2.send(commandFrame("SET", "after", "recovered"))
+	if got := c2.next(); got != protocol.SimpleString("OK") {
+		t.Fatalf("SET after recovery = %#v, want OK", got)
+	}
+	ts.shutdown()
+
+	cmds := replayAOF(t, path)
+	if len(cmds) != 2 {
+		t.Fatalf("log holds %d commands, want 2 (the replayed one and the new one)", len(cmds))
+	}
+	if got := argsOf(t, cmds[1]); got[0] != "SET" || got[1] != "after" || got[2] != "recovered" {
+		t.Fatalf("second logged command = %q, want the write made after recovery", got)
+	}
+}
+
+// TestWriteCommandsAreLogged asserts both halves of the logging rule at once:
+// every write reaches the log, and nothing else does. Asserting only the first
+// would pass for a server that logged everything.
+func TestWriteCommandsAreLogged(t *testing.T) {
+	discardLogs(t)
+	path := filepath.Join(t.TempDir(), "writes.aof")
+
+	ts := startServerWithAOF(t, path)
+	c := ts.client(t)
+
+	// Mixed case on purpose: the log must record the bytes the client sent,
+	// not a normalized form, so replay re-runs exactly the command that ran.
+	c.send(commandFrame("set", "key", "value"))
+	if got := c.next(); got != protocol.SimpleString("OK") {
+		t.Fatalf("SET = %#v, want OK", got)
+	}
+	c.send(expireFrame("EXPIRE", "key", 100))
+	if got := c.next(); got != protocol.Integer(1) {
+		t.Fatalf("EXPIRE = %#v, want 1", got)
+	}
+	c.send(commandFrame("DEL", "key"))
+	if got := c.next(); got != protocol.Integer(1) {
+		t.Fatalf("DEL = %#v, want 1", got)
+	}
+
+	// A read in the middle of the writes, so an implementation that logged
+	// every command would be caught by position rather than only by count.
+	c.send(commandFrame("GET", "key"))
+	_ = c.next()
+
+	ts.shutdown()
+
+	cmds := replayAOF(t, path)
+	if len(cmds) != 3 {
+		t.Fatalf("log holds %d commands, want 3 writes: %#v", len(cmds), cmds)
+	}
+
+	want := [][]string{
+		{"set", "key", "value"},
+		{"EXPIRE", "key", "100"},
+		{"DEL", "key"},
+	}
+	for i, w := range want {
+		if got := argsOf(t, cmds[i]); !equalStrings(got, w) {
+			t.Fatalf("logged command %d = %q, want %q", i, got, w)
+		}
+	}
+}
+
+// TestReadCommandsAreNotLogged is the other half. A log of reads would replay
+// into a keyspace built from queries, and would grow without bound on a
+// read-heavy server — the exact opposite of what an append-only log is for.
+func TestReadCommandsAreNotLogged(t *testing.T) {
+	discardLogs(t)
+	path := filepath.Join(t.TempDir(), "reads.aof")
+
+	ts := startServerWithAOF(t, path)
+	c := ts.client(t)
+
+	c.send(pingFrame)
+	_ = c.next()
+	c.send(commandFrame("GET", "missing"))
+	_ = c.next()
+	c.send(commandFrame("EXISTS", "missing"))
+	_ = c.next()
+	c.send(commandFrame("TTL", "missing"))
+	_ = c.next()
+
+	ts.shutdown()
+
+	// The file exists — Open created it — but holds no commands.
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat(%s): %v", path, err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("log is %d bytes after only reads, want 0", info.Size())
+	}
+	if cmds := replayAOF(t, path); len(cmds) != 0 {
+		t.Fatalf("log holds %d commands after only reads, want 0: %#v", len(cmds), cmds)
+	}
+}
+
+// equalStrings compares two string slices.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

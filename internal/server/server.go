@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Oussama-Att/verdigris/internal/aof"
 	"github.com/Oussama-Att/verdigris/internal/commands"
 	"github.com/Oussama-Att/verdigris/internal/protocol"
 	"github.com/Oussama-Att/verdigris/internal/rdb"
@@ -77,6 +78,22 @@ type Server struct {
 	// An empty path makes both load and save no-ops rather than errors, so
 	// the rest of the server never has to ask whether persistence is on.
 	rdbPath string
+
+	// aofPath is the append-only log, or empty when it is disabled. It is
+	// kept alongside rdbPath rather than replacing it because the two are
+	// not alternatives for the whole process lifetime: the log is the
+	// startup source of truth, while SAVE still writes snapshots to rdbPath
+	// on demand.
+	aofPath string
+
+	// aof is the open log every connection appends write commands to. It is
+	// nil when no log is configured, which is the check the read loop makes.
+	//
+	// It is set by New after the existing log has been replayed, so the
+	// server never appends to a file whose contents it has not yet applied —
+	// doing so would interleave this run's writes with a previous run's
+	// unread ones and make the log unreplayable.
+	aof *aof.AOF
 
 	// registry routes decoded commands to handlers. It is set by New and read
 	// by every connection goroutine; a Registry is safe for concurrent use,
@@ -157,7 +174,41 @@ type Server struct {
 //
 // It returns an error only for a persistence failure: an unreadable or corrupt
 // snapshot. A missing file is not an error — it means this is the first run.
+//
+// This form configures no append-only log. It is exactly NewWithAOF with an
+// empty aofPath, kept because a caller that wants snapshot persistence only —
+// and the tests that predate the log — should not have to name a policy they
+// are not using.
 func New(addr string, clk store.Clock, sweepInterval time.Duration, rdbPath string) (*Server, error) {
+	return NewWithAOF(addr, clk, sweepInterval, rdbPath, "", aof.FsyncEverySec)
+}
+
+// NewWithAOF returns a Server that will listen on addr, with both persistence
+// mechanisms available.
+//
+// aofPath is the append-only log. When it is non-empty the log is the
+// startup source of truth: it is replayed before Listen, and rdbPath is not
+// read at all. The two are not both loaded because they describe the same
+// keyspace by different means, and applying a snapshot on top of a log would
+// either resurrect keys the log had deleted or discard writes the log
+// records, depending on which ran second. The log wins because it is the
+// finer-grained record: it holds individual commands, so it can represent
+// states a periodic snapshot never captured.
+//
+// rdbPath keeps its meaning under an AOF: SAVE still writes snapshots there,
+// and it is the only thing that reads them back. Setting both disables
+// nothing — it means "log my writes, and let me take a snapshot on demand".
+//
+// aofPolicy chooses when the log is fsynced. See aof.FsyncPolicy: everysec is
+// Redis's default and the right one for a server that has not been asked
+// otherwise.
+//
+// Startup order is store, registry, log, listen. It matters: the log is
+// replayed through the registry, so the registry must exist first, and the
+// handle the read loop appends to is opened last, after the replay has
+// finished reading. A corrupt log stops construction before a single
+// connection is accepted.
+func NewWithAOF(addr string, clk store.Clock, sweepInterval time.Duration, rdbPath string, aofPath string, aofPolicy aof.FsyncPolicy) (*Server, error) {
 	if clk == nil {
 		clk = store.RealClock{}
 	}
@@ -177,14 +228,34 @@ func New(addr string, clk store.Clock, sweepInterval time.Duration, rdbPath stri
 		addr:    addr,
 		store:   kv,
 		rdbPath: rdbPath,
+		aofPath: aofPath,
 		done:    make(chan struct{}),
 	}
 	s.registry = commands.DefaultRegistry(kv, s.Save)
 
-	if err := s.load(); err != nil {
+	// Exactly one source is loaded, and the selection is made in one place so
+	// the rule cannot drift between the load and the log line that explains
+	// it.
+	var err error
+	if aofPath != "" {
+		if rdbPath != "" {
+			// Said out loud rather than silently: an operator who passed both
+			// flags and then restarts expecting their snapshot to be there
+			// needs to know it was not consulted, and the alternative —
+			// quietly loading one of the two — is the kind of behavior that
+			// gets discovered as data loss.
+			log.Printf("aof: -aof-path is set, so %s is not loaded; SAVE still writes it", rdbPath)
+		}
+		err = s.loadAOF(aofPolicy)
+	} else {
+		err = s.load()
+	}
+
+	if err != nil {
 		// The sweeper started by NewWithInterval is running and would outlive
 		// a failed construction, so it is stopped before returning. A caller
-		// that receives an error here has nothing to close.
+		// that receives an error here has nothing to close. The log handle, if
+		// one was opened, is closed by loadAOF's own failure path.
 		kv.Close()
 		return nil, err
 	}
@@ -223,6 +294,63 @@ func (s *Server) load() error {
 	unlock()
 
 	log.Printf("loaded %d keys from %s", len(entries), s.rdbPath)
+	return nil
+}
+
+// loadAOF replays the append-only log into the store and then opens it for
+// appending. It is the startup half of the AOF: everything below it is the
+// command path.
+//
+// The replay dispatches through the registry rather than reimplementing each
+// command, which is what keeps the log format and the command semantics from
+// drifting apart: there is exactly one SET, and replay calls it. The reply is
+// discarded because there is no client, and — the part that is easy to get
+// wrong — the replay does not append, or the log would re-log every command
+// it read on every start and grow without bound.
+//
+// A missing file is a first run, not an error. A corrupt one is fatal: the
+// bytes parsed far enough to prove the file is not merely short, so
+// continuing would mean serving a keyspace reconstructed from a log whose
+// middle is known to be wrong.
+func (s *Server) loadAOF(policy aof.FsyncPolicy) error {
+	cmds, err := aof.Replay(s.aofPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			log.Printf("no append-only log at %s; starting empty", s.aofPath)
+		} else {
+			// Wrapped with the path: aof.Replay's message names the file, but
+			// the caller sees this as "the server would not start", and the
+			// reason has to survive that framing.
+			return fmt.Errorf("aof: replay %s: %w", s.aofPath, err)
+		}
+	}
+
+	for i, cmd := range cmds {
+		// A command that fails to apply is a bug rather than bad input: the
+		// log was written by this program, from commands the registry already
+		// accepted once. Refusing to start is the honest response, because
+		// continuing would silently drop a write the client was told had
+		// happened.
+		if _, fault := s.registry.Dispatch(protocol.Array(cmd)); fault != nil {
+			return fmt.Errorf("aof: replay %s: command %d (%.32q) failed: %w", s.aofPath, i, describeArgs(cmd), fault)
+		}
+	}
+
+	if len(cmds) > 0 {
+		log.Printf("replayed %d commands from %s", len(cmds), s.aofPath)
+	}
+
+	// Opened only now, after the replay has finished reading. Appending to a
+	// file whose contents have not been applied yet would interleave this
+	// run's commands with a previous run's unread ones, and the resulting log
+	// would replay in an order that never happened.
+	handle, err := aof.Open(s.aofPath, policy)
+	if err != nil {
+		return fmt.Errorf("aof: open %s: %w", s.aofPath, err)
+	}
+	s.aof = handle
+
+	log.Printf("appending to %s (%s fsync)", s.aofPath, policy)
 	return nil
 }
 
@@ -390,7 +518,7 @@ func (s *Server) Shutdown(ctx context.Context) (err error) {
 
 	for {
 		if s.drained() {
-			return s.saveOnShutdown(nil)
+			return s.persistOnShutdown(nil)
 		}
 		select {
 		case <-ctx.Done():
@@ -401,29 +529,38 @@ func (s *Server) Shutdown(ctx context.Context) (err error) {
 			// Closing a net.Conn is documented as safe while another
 			// goroutine is blocked reading from it.
 			s.closeAllConns()
-			return s.saveOnShutdown(ctx.Err())
+			return s.persistOnShutdown(ctx.Err())
 		case <-ticker.C:
 			// Re-check whether the handlers have finished.
 		}
 	}
 }
 
-// saveOnShutdown writes the snapshot and combines the outcome with err, which
-// is either nil or the reason draining gave up.
+// persistOnShutdown closes the log and writes the snapshot, combining either
+// failure with err, which is either nil or the reason draining gave up.
+//
+// The log is closed first. It is the finer-grained record, so it is the one
+// that must not be left unsynced: Close flushes whatever the everysec ticker
+// has not yet written, and under FsyncNo it is the only sync the process ever
+// performs. A snapshot written after it is consistent with the log, because
+// both describe the same keyspace at the same moment — the drain has already
+// finished, so nothing can be mutating either.
+//
+// The snapshot is still written when a log is configured. SAVE remains the
+// manual-snapshot mechanism, and a shutdown that skipped it would silently
+// change what an operator's -rdb-path means depending on an unrelated flag.
 //
 // Both failures are reported rather than one overwriting the other: "shutdown
-// timed out" and "the snapshot could not be written" are independent facts,
-// and an operator seeing only the first would not know their data is still on
-// disk only up to the previous save.
-func (s *Server) saveOnShutdown(err error) error {
-	saveErr := s.Save()
-	if saveErr == nil {
-		return err
+// timed out", "the log could not be flushed" and "the snapshot could not be
+// written" are independent facts, and an operator seeing only the first would
+// not know how much of their data is actually on disk.
+func (s *Server) persistOnShutdown(err error) error {
+	if s.aof != nil {
+		err = errors.Join(err, s.aof.Close())
 	}
-	if err == nil {
-		return saveErr
-	}
-	return errors.Join(err, saveErr)
+
+	err = errors.Join(err, s.Save())
+	return err
 }
 
 // handleConnection owns one client connection for its whole life: setup, the
@@ -450,18 +587,20 @@ func (s *Server) handleConnection(conn net.Conn) {
 		_ = tcp.SetNoDelay(true)
 	}
 
-	readCommands(remote, bufio.NewReader(conn), bufio.NewWriter(conn), s.registry)
+	readCommands(remote, bufio.NewReader(conn), bufio.NewWriter(conn), s.registry, s.aof)
 }
 
-// readCommands is the loop: read bytes, decode one frame, dispatch it, encode
-// the reply, write it, repeat. It returns when the client disconnects or the
-// stream desynchronizes, and it never interprets a command — that is the
-// registry's job.
+// readCommands is the loop: read bytes, decode one frame, dispatch it, log it
+// if it is a write, encode the reply, write it, repeat. It returns when the
+// client disconnects or the stream desynchronizes, and it never interprets a
+// command — that is the registry's job.
 //
-// It is a free function rather than a method because it needs exactly three
-// things: where to read, where to write, and who decides. That makes the
-// shape of the loop readable on its own, and testable without a Server.
-func readCommands(remote string, reader *bufio.Reader, writer *bufio.Writer, registry *commands.Registry) {
+// It is a free function rather than a method because it needs exactly four
+// things: where to read, where to write, who decides, and where to log. That
+// makes the shape of the loop readable on its own, and testable without a
+// Server. aofLog is nil when no log is configured, which is the ordinary case
+// for a test and for a server started without -aof-path.
+func readCommands(remote string, reader *bufio.Reader, writer *bufio.Writer, registry *commands.Registry, aofLog *aof.AOF) {
 	chunk := make([]byte, readBufSize)
 
 	// buf accumulates bytes that have arrived but do not yet form a complete
@@ -522,6 +661,26 @@ func readCommands(remote string, reader *bufio.Reader, writer *bufio.Writer, reg
 				log.Printf("internal fault from %s: %v", remote, fault)
 				reply = protocol.Error("ERR internal error")
 			}
+
+			// The log entry is written here, after the command has run and
+			// before the reply leaves. That ordering is the whole durability
+			// contract: a client never sees OK for a write that was not
+			// logged, so a restart cannot lose a command the client was told
+			// had succeeded. Logging first instead would record commands
+			// that then failed; logging after the reply would open a window
+			// where a crash loses a write the client already believes is
+			// durable.
+			//
+			// A logging failure does not change the reply. The command has
+			// already run — its effect is in the keyspace every other client
+			// can see — so replacing its reply with an error would tell the
+			// client the write did not happen when it did, and a client that
+			// retries on error would perform it twice. The failure is logged
+			// where an operator can see it, and the reply stands.
+			if aofLog != nil && fault == nil {
+				logWrite(remote, registry, aofLog, value)
+			}
+
 			if writeErr := writeReply(writer, reply); writeErr != nil {
 				log.Printf("write to %s: %v", remote, writeErr)
 				return
@@ -550,6 +709,101 @@ func readCommands(remote string, reader *bufio.Reader, writer *bufio.Writer, reg
 			return
 		}
 	}
+}
+
+// logWrite appends a write command to the log, and does nothing for a command
+// that is not a write.
+//
+// The name is taken from the first argument and matched case-insensitively,
+// which is the same normalization the registry used to find the handler: the
+// command that ran is the command that is logged, with no second opinion about
+// what counts as a write.
+//
+// Failures are logged and not returned. See the call site for why the reply
+// must stand regardless.
+func logWrite(remote string, registry *commands.Registry, aofLog *aof.AOF, value protocol.Value) {
+	name, ok := extractName(value)
+	if !ok || !registry.IsWrite(name) {
+		return
+	}
+
+	args, ok := commandArgs(value)
+	if !ok {
+		// Unreachable for a real client: every command arrives as an array of
+		// bulk strings, which is what the decoder produces. If it ever
+		// happens, the alternative to skipping is writing a frame whose
+		// contents are not what ran, and a log that is wrong is worse than a
+		// log that is short — the wrong entry survives every restart.
+		log.Printf("aof: %s: write command %q has a non-bulk-string argument; not logged", remote, name)
+		return
+	}
+
+	// Append is called here, after the command has run and before the reply is
+	// written by the caller, so a successful reply implies a log entry.
+	if err := aofLog.Append(args); err != nil {
+		log.Printf("aof: %s: append %q: %v", remote, name, err)
+	}
+}
+
+// extractName returns the command name from a decoded frame: the first
+// argument, as a string.
+//
+// A frame that is not an array, or whose first element is not a bulk string,
+// has no command name. The registry will have answered such a frame with an
+// error and dispatched nothing, so there is nothing to log and no fault to
+// report — false here means "not a command", not "something went wrong".
+func extractName(value protocol.Value) (string, bool) {
+	arr, ok := value.(protocol.Array)
+	if !ok || len(arr) == 0 {
+		return "", false
+	}
+	name, ok := arr[0].(protocol.BulkString)
+	if !ok {
+		return "", false
+	}
+	return string(name), true
+}
+
+// commandArgs returns the frame's arguments as the values Append expects.
+//
+// The conversion is an assertion rather than a coercion. A command from a
+// real client is an array of bulk strings and converts losslessly; anything
+// else reports false, because turning a value of another type into a bulk
+// string would write a frame that differs from the command that ran, and the
+// log would then replay something the client never sent.
+func commandArgs(value protocol.Value) ([]protocol.Value, bool) {
+	arr, ok := value.(protocol.Array)
+	if !ok {
+		return nil, false
+	}
+	args := make([]protocol.Value, len(arr))
+	for i, arg := range arr {
+		bulk, ok := arg.(protocol.BulkString)
+		if !ok {
+			return nil, false
+		}
+		args[i] = bulk
+	}
+	return args, true
+}
+
+// describeArgs renders a command's arguments for a log line, for the replay
+// failure message. It is deliberately lossy and bounded: its input is a log
+// entry that may hold arbitrary bytes, and a failure message that dumped
+// megabytes of them would be unreadable exactly when it is needed.
+//
+// fmt rather than a String method call because Value's method set does not
+// include String — the implementations have it, the interface does not — so
+// this goes through the Stringer check at run time.
+func describeArgs(cmd []protocol.Value) string {
+	var b strings.Builder
+	for i, arg := range cmd {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, "%v", arg)
+	}
+	return b.String()
 }
 
 // readChunk reads the next piece of a request into chunk, returning the

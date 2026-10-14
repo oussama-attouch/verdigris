@@ -4,13 +4,19 @@ A Redis-compatible key-value store, written from scratch in Go.
 
 ## Status
 
-Milestones 1–6 complete. The server is a working string store with key
-expiration and snapshot persistence: `SET`, `GET`, `DEL`, `EXISTS`, `EXPIRE`,
-`TTL`, `PERSIST` and `SAVE` operate on a keyspace shared by every connection,
-with `SET ... EX/PX` for time-limited writes. Expired keys are removed both on
-access and by a background sweeper, and every TTL test runs on an injected
-clock rather than sleeping. With `-rdb-path` the keyspace is written on
-graceful shutdown and on `SAVE`, and loaded on startup. No append-only log yet.
+Milestones 1–7 complete. The server is a working string store with key
+expiration and two persistence mechanisms: `SET`, `GET`, `DEL`, `EXISTS`,
+`EXPIRE`, `TTL`, `PERSIST` and `SAVE` operate on a keyspace shared by every
+connection, with `SET ... EX/PX` for time-limited writes. Expired keys are
+removed both on access and by a background sweeper, and every TTL test runs on
+an injected clock rather than sleeping.
+
+Persistence is an append-only log, a point-in-time snapshot, or both. With
+`-aof-path` every write command is appended to a RESP-encoded log and replayed
+on startup, so a hard kill loses at most the last un-fsynced second rather
+than everything since the last save. With `-rdb-path` the keyspace is written
+on graceful shutdown and on `SAVE`, and loaded on startup. Given both, the log
+is the startup source of truth and `SAVE` still writes snapshots on demand.
 
 ## Why
 
@@ -45,20 +51,48 @@ go run ./cmd/verdigris
 ```bash
 go run ./cmd/verdigris              # listens on :6379
 go run ./cmd/verdigris -port 7000
-go run ./cmd/verdigris -rdb-path ./dump.rdb   # survives a restart
+go run ./cmd/verdigris -rdb-path ./dump.rdb   # snapshot on shutdown and SAVE
+go run ./cmd/verdigris -aof-path ./appendonly.aof -aof-fsync everysec
+go run ./cmd/verdigris -aof-path ./appendonly.aof -rdb-path ./dump.rdb
 ```
 
-Without `-rdb-path` the server keeps everything in memory and writes nothing —
-no file is created, and a restart starts empty. With it, the keyspace is saved
-on graceful shutdown (Ctrl-C) and on the `SAVE` command, and loaded at startup.
-A hard kill loses everything since the last save, which the append-only log in
-milestone 7 will close.
+Without either path the server keeps everything in memory and writes nothing —
+no file is created, and a restart starts empty.
+
+With `-rdb-path` the keyspace is saved on graceful shutdown (Ctrl-C) and on the
+`SAVE` command, and loaded at startup. A hard kill loses everything since the
+last save.
+
+With `-aof-path` every write command (`SET`, `DEL`, `EXPIRE`, `PERSIST`) is
+appended to a log of RESP-encoded commands — the same bytes a client would
+send — and replayed at startup. `-aof-fsync` chooses when that log is flushed:
+
+| Value | Meaning |
+|---|---|
+| `always` | fsync after every write; the slowest and the most durable |
+| `everysec` | fsync once per second from a background goroutine (default) |
+| `no` | let the operating system decide; fastest, least durable |
+
+`everysec` is Redis's own default and the right trade for a server: a hard kill
+loses at most the last second of writes. A crash can also leave the final
+command half-written; the loader cuts the log back to the last complete command
+and applies the rest rather than refusing to start.
+
+When both paths are set, the log is the startup source of truth and the
+snapshot is not loaded — the two describe the same keyspace by different means,
+and applying one over the other would either resurrect deleted keys or discard
+logged writes. `SAVE` still writes the snapshot, which remains the way to take
+a point-in-time copy.
+
+A corrupt log or snapshot is a fatal startup error rather than a silent
+fallback to an empty keyspace — a server that cannot read its data should not
+pretend there was none.
 
 The snapshot is written atomically: a temporary file is written, synced, and
 renamed over the target, so an interrupted save leaves the previous snapshot
-intact rather than a half-written one. A corrupt snapshot is a fatal startup
-error rather than a silent fallback to an empty keyspace — a server that cannot
-read its data should not pretend there was none.
+intact rather than a half-written one. The log needs no such dance — it is
+append-only, so a partial write can only ever damage its last frame, which is
+why recovery is a truncation rather than a refusal.
 
 The server speaks RESP, so the real client is the right way to try it:
 
@@ -75,6 +109,18 @@ redis-cli TTL session                # (integer) 5, then counts down
 redis-cli SAVE                       # OK
 redis-cli NOTACOMMAND                # (error) ERR unknown command 'NOTACOMMAND'
 ```
+
+With `-aof-path`, the writes above are logged as they happen. The log is plain
+RESP — the exact bytes a client sends — so it can be read with any RESP-aware
+tool. After `SET persistent-key "hello"` the file's whole contents are:
+
+```
+*3\r\n$3\r\nSET\r\n$14\r\npersistent-key\r\n$5\r\nhello\r\n
+```
+
+which is the length-prefixed encoding of the three arguments. Because it is
+RESP, it can also be piped straight back into a server: `redis-cli --pipe <
+appendonly.aof` re-applies every logged command.
 
 The keyspace is shared by every connection, so a value set by one client is
 visible to the next. Command names are case-insensitive, as they are in Redis.
@@ -93,7 +139,11 @@ $c.Close()
 ```
 
 Stop it with Ctrl-C; the server closes the listener, waits for in-flight
-connections, and exits 0. `-port` outside 1–65535 prints usage and exits 2.
+connections, drains them, flushes the log, writes the snapshot, and exits 0.
+`-port` outside 1–65535, a non-positive `-sweep-interval`, an unrecognized
+`-aof-fsync`, or a `-rdb-path`/`-aof-path` whose directory does not exist all
+print usage and exit 2. A corrupt log or snapshot exits 1 before the listener
+opens.
 
 ## License
 
