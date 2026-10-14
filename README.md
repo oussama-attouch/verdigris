@@ -145,6 +145,31 @@ connections, drains them, flushes the log, writes the snapshot, and exits 0.
 print usage and exit 2. A corrupt log or snapshot exits 1 before the listener
 opens.
 
+## Benchmarks
+
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) holds the full matrix — three
+concurrency levels across `ping`, `set`, `get` and `mixed` — and the
+explanation for every difference it shows. Verdigris was compared against
+Redis 5.0.14.1 using one client, `cmd/vg-bench`, with identical flags on both
+sides and the only variable being which server was at the other end of the
+socket; Verdigris ran with AOF persistence at `everysec` and Redis with RDB
+snapshotting disabled, so neither pays a disk round trip on the hot path.
+
+On this Windows host Verdigris serves roughly 3–4× Redis's throughput above
+one concurrent client, because Redis's throughput there is flat at
+~11–12k ops/sec from 10 clients to 200 — a fixed per-operation cost in that
+build rather than anything about Redis on Linux, which this report does not
+measure and does not claim to. Verdigris pays for its result in the ways you
+would expect: an RWMutex around the store, a copy of the key and value on
+every read and write, and `protocol.Encode`/`Decode` running on every request.
+
+Two caveats before you read the numbers. Windows' system clock advances in
+~0.5 ms steps, so per-request `p50` reads 0.000 ms on both servers and the
+percentiles cannot resolve sub-millisecond latency at all; the trustworthy
+figures are ops/sec and mean latency, which is derived from total elapsed time.
+And nothing here was profiled, so the *reason* for Redis's ceiling is inferred
+from the shape of its curve, not measured.
+
 ## License
 
 MIT
