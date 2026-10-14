@@ -3,6 +3,49 @@
 Every non-obvious choice gets an entry. Format: date · decision · context ·
 alternatives · reason.
 
+## 2026-10-14 — AOF file format is RESP
+
+Context: Redis's AOF is a sequence of RESP-encoded commands. An
+alternative would be a custom binary format, a JSON log, or a text log
+of "SET foo bar" lines.
+
+Decision: the file is exactly the bytes a client would send. A command
+is a RESP array of bulk strings:
+`*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n`.
+
+Reason: the format is already implemented (protocol.Encode), trivially
+readable by any RESP-aware tool, and a future DEBUG LOAD could pipe the
+file to a running server as-is. JSON loses binary-safety; a text log
+requires a second parser with its own edge cases.
+
+## 2026-10-14 — fsync policy: everysec default, matching Redis
+
+Context: fsync is the durability primitive. Always → one disk
+round-trip per command. No → OS decides, can buffer minutes.
+
+Decision: three policies selected by a flag. Default everysec.
+- `always` — fsync after every append.
+- `everysec` — background goroutine fsyncs once per second.
+- `no` — OS flushes on its own.
+
+Everysec loses at most ~1 second of writes on a hard kill. Redis's own
+default, and the correct default here.
+
+Alternatives: always by default (correct but one disk round-trip per
+write, which is the wrong default for a server that has not been asked
+for it); no by default (fastest, but the log's entire reason to exist
+over RDB is the smaller loss window, and letting the OS buffer for
+minutes gives that up).
+
+The tail is the second half of the decision. A crash mid-write leaves a
+partial command at the end of the file, and that is expected rather than
+corrupt, so Replay truncates the file to the last complete command and
+returns the valid prefix. A protocol error before the tail is genuine
+corruption and is fatal. The split follows Redis and follows the
+evidence: a partial last frame is what a crash produces, while a bad
+byte in the middle cannot be produced by any crash and can only mean the
+file was damaged or written by something else.
+
 ## 2026-10-05 — RDB file format: magic + version + count + entries + CRC32
 
 Context: The store needs a file format that round-trips keys, values, and
